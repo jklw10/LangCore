@@ -1,94 +1,10 @@
 import ctypes
 import os
 import glob
-
 import traceback
 import macros
-import AST
 import compiler
-import tokens
 import disasm 
-"""
-LANGUAGE DESIGN PHILOSOPHY & SPECIFICATION:
-No Primitive Types: 
-   The compiler natively has no concept of `int`, `float`, or `bool`. 
-   The implicit default type is raw memory (`bytes`).
-
-Types are Comptime Memory Slices: 
-   A "Type" is simply an alias for an allocation size on the stack. 
-   Example: `int = (bytes[:4])` tells the compiler to allocate 4 bytes.
-   
-   This should enable typed pointer's benefits?.
-
-Library-Defined Operations: 
-   Operators (+, -, *, ==) are not built-in. They are syntactic sugar for 
-   type methods (e.g., `value.@op(+)`). The Standard Library defines these 
-   using inline `@asm` mapped to raw CPU instructions.
-
-
-Data Movement (:) vs. Mutation (=):
-   `:` denotes value movement, type aliasing, or passing data across scopes.
-     it is "to", "0:4" = "0 to 4", (in):{ctx}:res, is a pipeline definition.
-   `=` denotes explicit identity assignment and runtime memory mutation.
-     it is "is", "res = 4"
-
-The Universal Pipeline Construct: 
-   There is syntactically no distinction between functions, loops, namespaces, 
-   and type definitions. They are all structural variants of a Universal Pipeline.
-   Format: `return = (bindings) : { body } `
-
-   
-Data-Driven Control Flow (Zero-Keyword Branching):
-   The language contains ZERO native control flow keywords (`if`, `while`, `else`).
-   Conditional branching is an emergent property of temporal pipelines (loops). 
-   An "if statement" is simply a loop pipeline constrained to execute 0 or 1 times 
-   based on a dynamic truth condition (e.g., `( c = 0 : condition ) : { ... }`).
-   
-Pre-Declaration & Zero-Initialization:
-   Declaring a typed variable at a block boundary (e.g., `res[int] = ... : { }`) 
-   allocates and zero-initializes it in the outer scope, allowing inner 
-   blocks to mutate it explicitly without scope-popping issues.
-
-Raw Memory & Unsafe Transparency:
-   The language operates as an ultra-high-level macro assembler. Direct 
-   memory dereferencing (`[ptr]`), pointer arithmetic, and transparent 
-   bridging to CPU registers via `@asm` are first-class workflows. Strings 
-   do not exist natively; they are treated strictly as memory slices or 
-   embedded binaries.
-
-Explicit mutation:
-  No hidden mutations, aka no side effects without visibility
-
-Pattern matching via multifunction:
-  If a binding has x==value, it is now a pattern to match
-  eg.
-  match = {
-    case:result = (x==1, y): {result = y*2}
-    case:result = (x, y): {result = y}
-  }
-  match.case(0,1)
-
-Caller is responsible for allocation.
-A pipeline's only purpose is to transform data.
-Aim to be rid of all keywords.
-
-minimalist version (current impl)
-
-@expr(9, a, ==, b) : out = (a, b) : {
-    @asm(sub, out, a, b);
-    @asm(sltiu, out, out, 1);
-};
-
-@expr(2, if, cond, t_body) : out = (cond, t_body) : {
-    _run = cond;
-    (_run) : {
-        t_body;
-        _run = 0; 
-    };
-};
-
-these are possible.
-"""
 
 def load_cpu_lib():
     """Loads the RISC-V CPU C library."""
@@ -107,7 +23,7 @@ def load_cpu_lib():
             ("halt",   ctypes.c_bool),
         ]
 
-    lib.init_cpu.argtypes = [ctypes.POINTER(RiscVState)]
+    lib.init_cpu.argtypes =[ctypes.POINTER(RiscVState)]
     lib.run_cycles.argtypes =[ctypes.POINTER(RiscVState), ctypes.c_uint32]
     
     return lib, RiscVState
@@ -120,15 +36,10 @@ def compile_file(filepath):
     macros.asm.fixups = {}
     macros.asm.pc = 0
     
-    with open(filepath, 'r') as f:
-        source = f.read()
-        
-    test_tokens = tokens.tokenize(source)
-    ast = AST.parse(test_tokens)
-    comp = compiler.Compiler()
+    # 4-Pass Compilation using the new Workspace implementation
+    workspace = compiler.Workspace()
+    compiled_asm = workspace.compile_project(filepath)
     
-    # Returns the populated global RiscVAssembler
-    compiled_asm = comp.compile(ast)
     return compiled_asm.get_binary()
 
 def run_program(lib, RiscVState, filepath):
@@ -169,12 +80,10 @@ def run_program(lib, RiscVState, filepath):
         cycles += 1
         
         # Check simulated Memory-Mapped I/O at address 65000
-        # Because we do word-stores (4 bytes), byte 65000 gets the integer value.
         val = cpu_state.memory[65000]
         if val != 255:
-            print(f"[{cycles} cycles] Pixel ON! -> Memory[65000] received value: {val}")
+            print(f"[{cycles} cycles] Memory[65000] received value: {val}")
             
-            # Reset pixel so we can catch subsequent writes
             cpu_state.memory[65000] = 255
 
     print(f"\nExecution finished in {cycles} cycles.")

@@ -1,9 +1,7 @@
-# --- START OF FILE AST.py ---
-
 import copy
 from dataclasses import dataclass, field
 from enum import Enum, auto
-from typing import List, Any, Optional
+from typing import List, Any, Optional, Dict
 from tokens import Token, TokenType
 
 class NodeType(Enum):
@@ -30,16 +28,19 @@ class ASTNode:
     right: Optional['ASTNode'] = None
     children: List['ASTNode'] = field(default_factory=list)
     macro_rule: Any = None
+    type_name: str = None  # New: tracks the comptime type identifier (e.g. "bool")
     line: int = 0
     col: int = 0
 
 class MacroRule:
-    def __init__(self, prec, pattern, holes, out_name, body):
+    def __init__(self, prec, pattern, holes, out_name, body, hole_types=None, out_type=None):
         self.prec = prec
         self.pattern = pattern
         self.holes = holes
         self.out_name = out_name
         self.body = body
+        self.hole_types = hole_types or {} # Map of hole_name -> required type (e.g. {'cond': 'bool'})
+        self.out_type = out_type           # Return type of the macro (e.g. 'bool')
 
 class MacroRegistry:
     def __init__(self):
@@ -56,7 +57,6 @@ class MacroRegistry:
         else:
             self.nud_rules.setdefault(first,[]).append(rule)
 
-registry = MacroRegistry()
 
 def substitute_ast(node, captured):
     if node is None:
@@ -69,7 +69,7 @@ def substitute_ast(node, captured):
         if node.value in captured:
             return copy.deepcopy(captured[node.value])
             
-    new_node = copy.copy(node)
+    new_node = copy.copy(node) # Shallow copy keeps type_name
     if getattr(new_node, 'left', None):
         new_node.left = substitute_ast(new_node.left, captured)
     if getattr(new_node, 'right', None):
@@ -78,11 +78,27 @@ def substitute_ast(node, captured):
         new_node.children =[substitute_ast(c, captured) for c in new_node.children]
     return new_node
 
+
 class Parser:
-    def __init__(self, token_list):
+    def __init__(self, token_list, registry, skip_blocks=False, type_env=None):
         self.tokens = token_list
         self.i = 0
+        self.registry = registry
+        self.skip_blocks = skip_blocks
         
+        # Scope stack for type definitions (starts with global_types if passed)
+        self.type_scopes =[type_env.copy() if type_env else {}]
+
+    def declare_type(self, name, type_name):
+        if name and type_name:
+            self.type_scopes[-1][name] = type_name
+
+    def get_type(self, name):
+        for scope in reversed(self.type_scopes):
+            if name in scope:
+                return scope[name]
+        return None
+
     def peek(self):
         if self.i < len(self.tokens):
             t = self.tokens[self.i]
@@ -118,9 +134,20 @@ class Parser:
             if t.value == ':': return 20
             if t.value == ',': return 30
             if t.value == '(': return 40   
-            if t.value in registry.led_rules:
-                return max(r.prec for r in registry.led_rules[t.value])
+            if t.value == '[': return 50
+            if t.value == '.': return 60 
+            if t.value in self.registry.led_rules:
+                return max(r.prec for r in self.registry.led_rules[t.value])
         return 0
+
+    def parse_program(self):
+        root = ASTNode(NodeType.Program, line=1, col=1)
+        while self.peek():
+            stmt = self.parse_expr()
+            if stmt: 
+                root.children.append(stmt)
+            self.match(';')
+        return root
 
     def parse_expr(self, rbp=0):
         t = self.consume()
@@ -145,11 +172,27 @@ class Parser:
         if (t.type == TokenType.SYMBOL):
             if t.value == '{':
                 block = ASTNode(NodeType.Block, line=t.line, col=t.col)
-                while self.peek() and not self.match('}'):
+                
+                # Discovery Pass explicitly ignores blocks to save extreme amounts of compute
+                if self.skip_blocks:
+                    depth = 1
+                    while self.peek():
+                        nxt = self.consume()
+                        if getattr(nxt, 'value', None) == '{': depth += 1
+                        elif getattr(nxt, 'value', None) == '}': 
+                            depth -= 1
+                            if depth == 0: break
+                    return block
+
+                self.type_scopes.append({})
+                while self.peek() and not getattr(self.peek(), 'value', None) == '}':
                     stmt = self.parse_expr()
                     if stmt: block.children.append(stmt)
                     self.match(';') 
+                self.consume() # consume '}'
+                self.type_scopes.pop()
                 return block
+
             if t.value == '(':
                 if self.peek() and getattr(self.peek(), 'value', None) == ')':
                     self.consume()
@@ -157,11 +200,25 @@ class Parser:
                 expr = self.parse_expr(0)
                 self.match(')')
                 return expr
+
+            # Array Deref (e.g. `[ptr]`)
             if t.value == '[':
                 expr = self.parse_expr()
                 self.match(']')
                 return ASTNode(NodeType.Deref, left=expr, line=t.line, col=t.col)
-
+            if t.value == '.':
+                next_t = self.consume()
+                if getattr(next_t, 'value', None) == '@':
+                    name_t = self.consume(TokenType.IDENTIFIER)
+                    if name_t.value == 'expr':
+                        return self.parse_macro_def(name_t)
+                    elif name_t.value == 'asm':
+                        return self.parse_asm_intrinsic(name_t)
+                elif getattr(next_t, 'type', None) == TokenType.IDENTIFIER:
+                    node = ASTNode(NodeType.Identifier, value="." + next_t.value, line=t.line, col=t.col)
+                    node.type_name = self.get_type("." + next_t.value)
+                    return node
+                raise SyntaxError(f"Unexpected token after '.' at line {t.line}:{t.col}")
             # --- INTRINSICS & MACROS ---
             if t.value == '@':
                 next_t = self.consume(TokenType.IDENTIFIER)
@@ -172,20 +229,24 @@ class Parser:
                 elif next_t.value in ('import', 'embed'):
                     self.match('(')
                     path_tokens =[]
-                    while self.peek() and not self.match(')'):
+                    while self.peek() and not getattr(self.peek(), 'value', None) == ')':
                         path_tokens.append(str(getattr(self.consume(), 'value', '')))
+                    self.match(')')
                     path = "".join(path_tokens)
                     return ASTNode(NodeType.Intrinsic, value=next_t.value, children=[path], line=t.line, col=t.col)
                 else:
                     raise SyntaxError(f"Unknown intrinsic @{next_t.value} at line {next_t.line}:{next_t.col}")
             
-            if t.value in registry.nud_rules:
-                return self.expand_macro(registry.nud_rules[t.value], t, None)
+            if t.value in self.registry.nud_rules:
+                return self.expand_macro(self.registry.nud_rules[t.value], t, None)
 
         elif (t.type == TokenType.IDENTIFIER):
-            if t.value in registry.nud_rules:
-                return self.expand_macro(registry.nud_rules[t.value], t, None)
-            return ASTNode(NodeType.Identifier, value=t.value, line=t.line, col=t.col)
+            if t.value in self.registry.nud_rules:
+                return self.expand_macro(self.registry.nud_rules[t.value], t, None)
+            
+            node = ASTNode(NodeType.Identifier, value=t.value, line=t.line, col=t.col)
+            node.type_name = self.get_type(t.value) # Hooking up type-awareness to identifers
+            return node
 
         elif (t.type == TokenType.VALUE):
             return ASTNode(NodeType.Value, value=t.value, line=t.line, col=t.col)
@@ -205,12 +266,28 @@ class Parser:
                 self.match(')')
                 
                 if left.node_type == NodeType.Identifier:
-                    return ASTNode(NodeType.Call, value=left.value, children=args, line=t.line, col=t.col)
+                    call_node = ASTNode(NodeType.Call, value=left.value, children=args, line=t.line, col=t.col)
+                    call_node.type_name = self.get_type(left.value) # Propagating return type dynamically
+                    return call_node
                 else:
                     raise SyntaxError(f"Syntax Error at line {t.line}:{t.col} -> Cannot call non-identifier {getattr(left, 'value', left)}")
 
+            # Type casting postfix `res[int]`
+            if t.value == '[':
+                type_expr = self.parse_expr(0)
+                self.match(']')
+                
+                type_name = type_expr.value if hasattr(type_expr, 'value') else str(type_expr)
+                left.type_name = type_name
+                
+                if left.node_type == NodeType.Identifier:
+                    self.declare_type(left.value, type_name)
+                return left
+
             if t.value == '=':
                 right = self.parse_expr(prec - 1)
+                
+                # Check for `func_name : ret_var = (args) : { body }`
                 if left.node_type == NodeType.Pipeline and \
                    left.left.node_type == NodeType.Identifier and \
                    left.right.node_type == NodeType.Identifier:
@@ -223,21 +300,32 @@ class Parser:
                                        line=t.line, col=t.col)
                                        
                 return ASTNode(NodeType.Assignment, left=left, right=right, line=t.line, col=t.col)
+
             if t.value == ':':
                 right = self.parse_expr(prec - 1)
                 return ASTNode(NodeType.Pipeline, left=left, right=right, line=t.line, col=t.col)
+            
             if t.value == ',':
                 right = self.parse_expr(prec)
                 if left.node_type == NodeType.Tuple:
                     left.children.append(right)
                     return left
                 return ASTNode(NodeType.Tuple, children=[left, right], line=t.line, col=t.col)
-            if t.value in registry.led_rules:
-                rules =[r for r in registry.led_rules[t.value] if r.prec == prec]
+            if t.value == '.':
+                right_t = self.consume(TokenType.IDENTIFIER)
+                if left.node_type == NodeType.Identifier:
+                    combined = left.value + "." + right_t.value
+                    node = ASTNode(NodeType.Identifier, value=combined, line=t.line, col=t.col)
+                    node.type_name = self.get_type(combined)
+                    return node
+                raise SyntaxError(f"Syntax Error: Can only use '.' on identifiers at {t.line}:{t.col}")
+            if t.value in self.registry.led_rules:
+                rules =[r for r in self.registry.led_rules[t.value] if r.prec == prec]
                 if rules:
                     return self.expand_macro(rules, t, left)
 
         raise SyntaxError(f"Unexpected infix operator {t} at line {t.line}:{t.col}")
+
 
     def expand_macro(self, rule_list, token, left):
         if not isinstance(rule_list, list):
@@ -249,24 +337,34 @@ class Parser:
             try:
                 captured = {}
                 start_idx = 1
+                
                 if left is not None:
+                    expected_left = rule.hole_types.get(rule.pattern[0])
+                    if expected_left and left.type_name != expected_left:
+                        raise SyntaxError(f"Macro type mismatch: '{rule.pattern[0]}' expected [{expected_left}], got [{left.type_name}]")
                     captured[rule.pattern[0]] = left
                     start_idx = 2 
                 
                 for p in rule.pattern[start_idx:]:
                     if p in rule.holes:
-                        captured[p] = self.parse_expr(rule.prec)
+                        arg_node = self.parse_expr(rule.prec)
+                        expected_type = rule.hole_types.get(p)
+                        
+                        if expected_type and getattr(arg_node, 'type_name', None) != expected_type:
+                            raise SyntaxError(f"Macro type mismatch: '{p}' expected[{expected_type}], got [{getattr(arg_node, 'type_name', None)}]")
+                            
+                        captured[p] = arg_node
                     else:
                         act = self.consume()
                         if act is None or getattr(act, 'value', str(act)) != p:
                             raise SyntaxError(f"Macro pattern expected '{p}', got '{act}' at line {getattr(act, 'line', 'EOF')}:{getattr(act, 'col', 'EOF')}")
                 
                 expanded_body = substitute_ast(rule.body, captured)
-                return ASTNode(NodeType.MacroCall, value=rule.out_name, left=expanded_body, line=token.line, col=token.col)
+                return ASTNode(NodeType.MacroCall, value=rule.out_name, left=expanded_body, type_name=rule.out_type, line=token.line, col=token.col)
             
             except SyntaxError as e:
                 last_error = e
-                self.i = saved_i
+                self.i = saved_i # BACKTRACK AND TRY NEXT MACRO!
                 
         raise last_error
 
@@ -277,10 +375,11 @@ class Parser:
         
         pattern =[]
         if self.match(','):
-            while self.peek() and not self.match(')'):
+            while self.peek() and not getattr(self.peek(), 'value', None) == ')':
                 tok = self.consume()
                 if getattr(tok, 'value', None) != ',':
                     pattern.append(getattr(tok, 'value', str(tok)))
+            self.match(')')
         else:
             self.match(')')
             while self.peek() and getattr(self.peek(), 'value', None) != ':':
@@ -288,21 +387,29 @@ class Parser:
                 pattern.append(getattr(tok, 'value', str(tok)))
                 
         self.match(':')
-        out_name = self.consume(TokenType.IDENTIFIER).value
+        out_name_tok = self.consume(TokenType.IDENTIFIER)
+        out_name = out_name_tok.value
+        out_type = None
         
+        # Capture return type
         if self.match('['):
-            self.consume(TokenType.IDENTIFIER) 
+            out_type = self.consume(TokenType.IDENTIFIER).value
             self.match(']')
             
         self.match('=')
         self.match('(')
         holes =[]
-        while self.peek() and not self.match(')'):
+        hole_types = {}
+        
+        while self.peek() and not getattr(self.peek(), 'value', None) == ')':
             tok = self.consume()
             if tok.type == TokenType.IDENTIFIER:
                 holes.append(tok.value)
+                
+                # Capture typed arguments dynamically 
                 if self.match('['):
-                    self.consume(TokenType.IDENTIFIER)
+                    t_type = self.consume(TokenType.IDENTIFIER).value
+                    hole_types[tok.value] = t_type
                     self.match(']')
             elif tok.type == TokenType.SYMBOL and tok.value == ',':
                 continue
@@ -310,26 +417,25 @@ class Parser:
         self.match(':')
         body = self.parse_expr()
         
-        rule = MacroRule(prec, pattern, holes, out_name, body)
-        registry.register(rule)
+        rule = MacroRule(prec, pattern, holes, out_name, body, hole_types, out_type)
+        self.registry.register(rule)
         return ASTNode(NodeType.MacroDef, macro_rule=rule, line=token.line, col=token.col)
 
     def parse_asm_intrinsic(self, token):
         self.match('(')
         inst_name = self.consume(TokenType.IDENTIFIER).value
         args =[]
-        while self.peek() and not self.match(')'):
+        while self.peek() and not getattr(self.peek(), 'value', None) == ')':
             if self.match(','): 
                 continue
             args.append(self.parse_expr(30))
+        self.match(')')
         return ASTNode(NodeType.Intrinsic, value="asm", children=[ASTNode(NodeType.Identifier, value=inst_name)] + args, line=token.line, col=token.col)
 
-def parse(token_list):
-    p = Parser(token_list)
-    root = ASTNode(NodeType.Program, line=1, col=1)
-    while p.peek():
-        stmt = p.parse_expr()
-        if stmt: 
-            root.children.append(stmt)
-        p.match(';')
-    return root
+
+# Main Entry Point Function for single-pass contexts (Deprecated, mostly kept for backward compatibility)
+def parse(token_list, registry=None, skip_blocks=False, type_env=None):
+    if registry is None: 
+        registry = MacroRegistry()
+    p = Parser(token_list, registry, skip_blocks, type_env)
+    return p.parse_program()

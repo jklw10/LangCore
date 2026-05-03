@@ -1,5 +1,3 @@
-# --- START OF FILE compiler.py ---
-
 import macros
 import tokens
 import AST
@@ -7,6 +5,86 @@ from macros import asm
 from AST import NodeType, ASTNode
 from typing import Dict, List, Optional
 from dataclasses import dataclass
+
+
+class Workspace:
+    def __init__(self):
+        self.global_types = {} # Maps Function names to their defined Return Types
+        self.macro_registry = AST.MacroRegistry()
+        self.loaded_files = set()
+
+    def compile_project(self, main_filepath):
+        # Passes 1 & 2: Tokenize and Discover top-level signatures (Skip blocks)
+        self.discover_file(main_filepath)
+
+        # Pass 3: Fully Semantic AST (Checks types, expands Macros, resolves variables)
+        full_ast = self.semantic_parse_file(main_filepath)
+
+        # Pass 4: Emitting Phase
+        comp = Compiler()
+        return comp.compile(full_ast)
+
+    def discover_file(self, filepath):
+        if filepath in self.loaded_files: 
+            return
+        self.loaded_files.add(filepath)
+
+        with open(filepath, 'r') as f:
+            source = f.read()
+        
+        token_list = tokens.tokenize(source)
+        
+        dummy_registry = AST.MacroRegistry()
+        parser = AST.Parser(token_list, dummy_registry, skip_blocks=False)
+        ast_skeleton = parser.parse_program()
+
+        self._extract_signatures(ast_skeleton, filepath)
+
+    def _extract_signatures(self, node, current_filepath, current_type=None):
+        if not node: 
+            return
+        
+        if node.node_type == NodeType.FunctionDef:
+            func_name = node.value
+            if func_name.startswith('.'):
+                if current_type:
+                    func_name = current_type + func_name
+                    node.value = func_name 
+            
+            ret_type = node.left.type_name if node.left else None
+            self.global_types[func_name] = ret_type
+            
+            new_type = current_type if func_name.startswith('.') else func_name
+            for child in node.children:
+                self._extract_signatures(child, current_filepath, new_type)
+
+    def semantic_parse_file(self, filepath):
+        with open(filepath, 'r') as f:
+            source = f.read()
+            
+        token_list = tokens.tokenize(source)
+        
+        # Full semantic parser hooked up to the type contexts discovered earlier
+        parser = AST.Parser(token_list, self.macro_registry, skip_blocks=False, type_env=self.global_types.copy())
+        ast_full = parser.parse_program()
+        
+        # Odin-style inline import replacement (So emission compiler doesn't have to)
+        self._inline_imports(ast_full)
+        return ast_full
+
+    def _inline_imports(self, node):
+        if not node or not hasattr(node, 'children'): return
+        new_children =[]
+        for child in node.children:
+            if child.node_type == NodeType.Intrinsic and child.value == "import":
+                path = child.children[0]
+                imported_ast = self.semantic_parse_file(path)
+                new_children.extend(imported_ast.children)
+            else:
+                self._inline_imports(child)
+                new_children.append(child)
+        node.children = new_children
+
 
 @dataclass
 class SymbolInfo:
@@ -56,6 +134,10 @@ class Compiler:
     
     def FunctionDef(self, node):
         func_name = node.value
+        
+        if func_name.startswith(".") and getattr(self, 'current_type_context', None):
+            func_name = self.current_type_context + func_name
+
         ret_var = node.left.value
         pattern_node = node.right
         body = node.children[0]
@@ -83,9 +165,13 @@ class Compiler:
                 macros.push(macros.x0)
                 self.current_stack_depth += asm.REGISTER_SIZE
                 out_sym = self.declare_symbol(definition['ret_var'])
+
+                old_type_ctx = getattr(self, 'current_type_context', None)
+                self.current_type_context = func_name
                 
                 self._compile_node(expanded_body)
                 
+                self.current_type_context = old_type_ctx
                 offset = out_sym.offset_from_base - self.current_stack_depth
                 asm.lw(macros.t0, macros.stack_ptr, offset)
                 self.exit_scope()
@@ -186,15 +272,15 @@ class Compiler:
         self.enter_scope()
         start_depth = self.current_stack_depth
         
-        old_type_ctx = getattr(self, 'current_type_context', None)
+        #old_type_ctx = getattr(self, 'current_type_context', None)
         old_blueprint_ctx = getattr(self, 'current_blueprint_context', None)
-        self.current_type_context = None
+        #self.current_type_context = None
         self.current_blueprint_context = None
         
         asm.label(l_start)
         
         if condition_node:
-            conditions = condition_node.children if condition_node.node_type == NodeType.Tuple else [condition_node]
+            conditions = condition_node.children if condition_node.node_type == NodeType.Tuple else[condition_node]
             for cond in conditions:
                 self._compile_node(cond)
                 macros.pop(macros.t0)
@@ -213,7 +299,7 @@ class Compiler:
             
         self.exit_scope()
 
-        self.current_type_context = old_type_ctx
+        #self.current_type_context = old_type_ctx
         self.current_blueprint_context = old_blueprint_ctx
 
     def Intrinsic(self, node):
@@ -221,19 +307,6 @@ class Compiler:
             self._compile_asm(node)
         elif node.value == "embed":
             self._compile_embed(node)
-        elif node.value == "import":
-            self._compile_import(node)
-
-    def _compile_import(self, node):
-        path = node.children[0]
-        with open(path, 'r') as f:
-            source = f.read()
-        imported_tokens = tokens.tokenize(source)
-        imported_ast = AST.parse(imported_tokens)
-        for child in imported_ast.children:
-            self._compile_node(child)
-        macros.push(macros.x0)
-        self.current_stack_depth += asm.REGISTER_SIZE
 
     def _compile_embed(self, node):
         path = node.children[0]
@@ -255,7 +328,7 @@ class Compiler:
         elif pattern_node.node_type == NodeType.Tuple:
             pat_args = pattern_node.children
         else:
-            pat_args =[pattern_node]
+            pat_args = [pattern_node]
             
         if len(pat_args) != len(call_args):
             return {}, False
