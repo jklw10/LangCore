@@ -1,3 +1,4 @@
+
 import macros
 import tokens
 import AST
@@ -9,18 +10,13 @@ from dataclasses import dataclass
 
 class Workspace:
     def __init__(self):
-        self.global_types = {} # Maps Function names to their defined Return Types
+        self.global_types = {} 
         self.macro_registry = AST.MacroRegistry()
         self.loaded_files = set()
 
     def compile_project(self, main_filepath):
-        # Passes 1 & 2: Tokenize and Discover top-level signatures (Skip blocks)
         self.discover_file(main_filepath)
-
-        # Pass 3: Fully Semantic AST (Checks types, expands Macros, resolves variables)
         full_ast = self.semantic_parse_file(main_filepath)
-
-        # Pass 4: Emitting Phase
         comp = Compiler()
         return comp.compile(full_ast)
 
@@ -35,7 +31,7 @@ class Workspace:
         token_list = tokens.tokenize(source)
         
         dummy_registry = AST.MacroRegistry()
-        parser = AST.Parser(token_list, dummy_registry, skip_blocks=False)
+        parser = AST.Parser(token_list, dummy_registry, skip_blocks=True)
         ast_skeleton = parser.parse_program()
 
         self._extract_signatures(ast_skeleton, filepath)
@@ -64,11 +60,9 @@ class Workspace:
             
         token_list = tokens.tokenize(source)
         
-        # Full semantic parser hooked up to the type contexts discovered earlier
         parser = AST.Parser(token_list, self.macro_registry, skip_blocks=False, type_env=self.global_types.copy())
         ast_full = parser.parse_program()
         
-        # Odin-style inline import replacement (So emission compiler doesn't have to)
         self._inline_imports(ast_full)
         return ast_full
 
@@ -96,6 +90,7 @@ class Compiler:
         self.current_stack_depth = 0
         self.label_counter = 0
         self.function_registry = {}
+        self.pure_context_out_var = None
 
     def get_symbol(self, name: str) -> Optional[SymbolInfo]:
         for scope in reversed(self.scopes):
@@ -143,7 +138,7 @@ class Compiler:
         body = node.children[0]
         
         if func_name not in self.function_registry:
-            self.function_registry[func_name] = []
+            self.function_registry[func_name] =[]
             
         self.function_registry[func_name].append({
             'ret_var': ret_var,
@@ -207,24 +202,41 @@ class Compiler:
     def MacroCall(self, node):
         self.enter_scope()
         
+        # Verify Visible Mutation Guarantee nesting
+        old_pure_out_var = self.pure_context_out_var
+        if node.is_pure:
+            self.pure_context_out_var = node.value # Allow assignment to the out var
+        elif old_pure_out_var is not None:
+            raise SyntaxError(f"Visible Mutation Guarantee Violation at {node.line}:{node.col} -> Pure macro cannot invoke a mutating macro.")
+
+        # Zero Init Default
         macros.push(macros.x0)
         self.current_stack_depth += asm.REGISTER_SIZE
         out_sym = self.declare_symbol(node.value)
         
         self._compile_node(node.left)
         
+        # Restore Context
+        self.pure_context_out_var = old_pure_out_var
+
         offset = out_sym.offset_from_base - self.current_stack_depth
         asm.lw(macros.t0, macros.stack_ptr, offset)
-        
         self.exit_scope()
 
         macros.pop(macros.t1) 
         self.current_stack_depth -= asm.REGISTER_SIZE
-
         macros.push(macros.t0)
         self.current_stack_depth += asm.REGISTER_SIZE
 
     def Assignment(self, node):
+        # Enforce Visible Mutation Guarantee inside macros
+        if self.pure_context_out_var is not None:
+            if node.left.node_type == NodeType.Identifier:
+                if node.left.value != self.pure_context_out_var:
+                    raise SyntaxError(f"Visible Mutation Guarantee Violation at {node.line}:{node.col} -> Pure macro cannot mutate external variable '{node.left.value}'")
+            elif node.left.node_type == NodeType.Deref:
+                raise SyntaxError(f"Visible Mutation Guarantee Violation at {node.line}:{node.col} -> Pure macro cannot mutate memory via pointer Deref")
+
         if node.left.node_type == NodeType.Identifier:
             name = node.left.value
             
@@ -249,7 +261,6 @@ class Compiler:
             
             macros.pop(macros.t0)
             self.current_stack_depth -= asm.REGISTER_SIZE
-            
             macros.pop(macros.t1)
             self.current_stack_depth -= asm.REGISTER_SIZE
             
@@ -272,11 +283,6 @@ class Compiler:
         self.enter_scope()
         start_depth = self.current_stack_depth
         
-        #old_type_ctx = getattr(self, 'current_type_context', None)
-        old_blueprint_ctx = getattr(self, 'current_blueprint_context', None)
-        #self.current_type_context = None
-        self.current_blueprint_context = None
-        
         asm.label(l_start)
         
         if condition_node:
@@ -298,9 +304,6 @@ class Compiler:
             self.current_stack_depth = start_depth
             
         self.exit_scope()
-
-        #self.current_type_context = old_type_ctx
-        self.current_blueprint_context = old_blueprint_ctx
 
     def Intrinsic(self, node):
         if node.value == "asm":
@@ -346,17 +349,20 @@ class Compiler:
 
     def _compile_asm(self, node):
         inst_name = node.children[0].value
+
+        # Enforce Visible Mutation Guarantee for pure macros using inline assembly
+        if self.pure_context_out_var is not None:
+            if inst_name in {"store", "sw", "sb"}:
+                raise SyntaxError(f"Visible Mutation Guarantee Violation at {node.line}:{node.col} -> Pure macro cannot use globally mutating instruction '{inst_name}'")
+
         args =[]
-        
         reg_map = macros.reg_map
         no_rd_instructions = macros.no_rd_instructions
         imm_positions = macros.imm_positions
-
         has_rd = inst_name not in no_rd_instructions
         
         temp_pool =[6, 7, 28, 29, 30, 31] 
         temp_idx = 0
-        
         store_back_sym = None
         rd_reg_to_push = 0
         
@@ -400,7 +406,6 @@ class Compiler:
                     
                     tmp_reg = temp_pool[temp_idx]
                     temp_idx += 1
-                    
                     offset = sym.offset_from_base - self.current_stack_depth
                     asm.lw(tmp_reg, macros.stack_ptr, offset)
                     args.append(tmp_reg)

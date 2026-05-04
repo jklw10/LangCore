@@ -1,3 +1,4 @@
+
 import copy
 from dataclasses import dataclass, field
 from enum import Enum, auto
@@ -28,19 +29,21 @@ class ASTNode:
     right: Optional['ASTNode'] = None
     children: List['ASTNode'] = field(default_factory=list)
     macro_rule: Any = None
-    type_name: str = None  # New: tracks the comptime type identifier (e.g. "bool")
+    type_name: str = None  
+    is_pure: bool = False  # Track if this node represents a pure macro execution
     line: int = 0
     col: int = 0
 
 class MacroRule:
-    def __init__(self, prec, pattern, holes, out_name, body, hole_types=None, out_type=None):
+    def __init__(self, prec, pattern, holes, out_name, body, hole_types=None, out_type=None, is_mutating=False):
         self.prec = prec
         self.pattern = pattern
         self.holes = holes
         self.out_name = out_name
         self.body = body
-        self.hole_types = hole_types or {} # Map of hole_name -> required type (e.g. {'cond': 'bool'})
-        self.out_type = out_type           # Return type of the macro (e.g. 'bool')
+        self.hole_types = hole_types or {} 
+        self.out_type = out_type           
+        self.is_mutating = is_mutating     # True if the pattern contains '='
 
 class MacroRegistry:
     def __init__(self):
@@ -69,7 +72,7 @@ def substitute_ast(node, captured):
         if node.value in captured:
             return copy.deepcopy(captured[node.value])
             
-    new_node = copy.copy(node) # Shallow copy keeps type_name
+    new_node = copy.copy(node) 
     if getattr(new_node, 'left', None):
         new_node.left = substitute_ast(new_node.left, captured)
     if getattr(new_node, 'right', None):
@@ -85,8 +88,6 @@ class Parser:
         self.i = 0
         self.registry = registry
         self.skip_blocks = skip_blocks
-        
-        # Scope stack for type definitions (starts with global_types if passed)
         self.type_scopes =[type_env.copy() if type_env else {}]
 
     def declare_type(self, name, type_name):
@@ -172,8 +173,6 @@ class Parser:
         if (t.type == TokenType.SYMBOL):
             if t.value == '{':
                 block = ASTNode(NodeType.Block, line=t.line, col=t.col)
-                
-                # Discovery Pass explicitly ignores blocks to save extreme amounts of compute
                 if self.skip_blocks:
                     depth = 1
                     while self.peek():
@@ -189,7 +188,7 @@ class Parser:
                     stmt = self.parse_expr()
                     if stmt: block.children.append(stmt)
                     self.match(';') 
-                self.consume() # consume '}'
+                self.consume()
                 self.type_scopes.pop()
                 return block
 
@@ -201,11 +200,11 @@ class Parser:
                 self.match(')')
                 return expr
 
-            # Array Deref (e.g. `[ptr]`)
             if t.value == '[':
                 expr = self.parse_expr()
                 self.match(']')
                 return ASTNode(NodeType.Deref, left=expr, line=t.line, col=t.col)
+                
             if t.value == '.':
                 next_t = self.consume()
                 if getattr(next_t, 'value', None) == '@':
@@ -219,7 +218,7 @@ class Parser:
                     node.type_name = self.get_type("." + next_t.value)
                     return node
                 raise SyntaxError(f"Unexpected token after '.' at line {t.line}:{t.col}")
-            # --- INTRINSICS & MACROS ---
+                
             if t.value == '@':
                 next_t = self.consume(TokenType.IDENTIFIER)
                 if next_t.value == 'expr':
@@ -245,7 +244,7 @@ class Parser:
                 return self.expand_macro(self.registry.nud_rules[t.value], t, None)
             
             node = ASTNode(NodeType.Identifier, value=t.value, line=t.line, col=t.col)
-            node.type_name = self.get_type(t.value) # Hooking up type-awareness to identifers
+            node.type_name = self.get_type(t.value)
             return node
 
         elif (t.type == TokenType.VALUE):
@@ -267,12 +266,11 @@ class Parser:
                 
                 if left.node_type == NodeType.Identifier:
                     call_node = ASTNode(NodeType.Call, value=left.value, children=args, line=t.line, col=t.col)
-                    call_node.type_name = self.get_type(left.value) # Propagating return type dynamically
+                    call_node.type_name = self.get_type(left.value)
                     return call_node
                 else:
                     raise SyntaxError(f"Syntax Error at line {t.line}:{t.col} -> Cannot call non-identifier {getattr(left, 'value', left)}")
 
-            # Type casting postfix `res[int]`
             if t.value == '[':
                 type_expr = self.parse_expr(0)
                 self.match(']')
@@ -287,7 +285,6 @@ class Parser:
             if t.value == '=':
                 right = self.parse_expr(prec - 1)
                 
-                # Check for `func_name : ret_var = (args) : { body }`
                 if left.node_type == NodeType.Pipeline and \
                    left.left.node_type == NodeType.Identifier and \
                    left.right.node_type == NodeType.Identifier:
@@ -311,6 +308,7 @@ class Parser:
                     left.children.append(right)
                     return left
                 return ASTNode(NodeType.Tuple, children=[left, right], line=t.line, col=t.col)
+                
             if t.value == '.':
                 right_t = self.consume(TokenType.IDENTIFIER)
                 if left.node_type == NodeType.Identifier:
@@ -319,13 +317,13 @@ class Parser:
                     node.type_name = self.get_type(combined)
                     return node
                 raise SyntaxError(f"Syntax Error: Can only use '.' on identifiers at {t.line}:{t.col}")
+                
             if t.value in self.registry.led_rules:
                 rules =[r for r in self.registry.led_rules[t.value] if r.prec == prec]
                 if rules:
                     return self.expand_macro(rules, t, left)
 
         raise SyntaxError(f"Unexpected infix operator {t} at line {t.line}:{t.col}")
-
 
     def expand_macro(self, rule_list, token, left):
         if not isinstance(rule_list, list):
@@ -341,7 +339,7 @@ class Parser:
                 if left is not None:
                     expected_left = rule.hole_types.get(rule.pattern[0])
                     if expected_left and left.type_name != expected_left:
-                        raise SyntaxError(f"Macro type mismatch: '{rule.pattern[0]}' expected [{expected_left}], got [{left.type_name}]")
+                        raise SyntaxError(f"Macro type mismatch: '{rule.pattern[0]}' expected [{expected_left}], got[{left.type_name}]")
                     captured[rule.pattern[0]] = left
                     start_idx = 2 
                 
@@ -351,7 +349,7 @@ class Parser:
                         expected_type = rule.hole_types.get(p)
                         
                         if expected_type and getattr(arg_node, 'type_name', None) != expected_type:
-                            raise SyntaxError(f"Macro type mismatch: '{p}' expected[{expected_type}], got [{getattr(arg_node, 'type_name', None)}]")
+                            raise SyntaxError(f"Macro type mismatch: '{p}' expected[{expected_type}], got[{getattr(arg_node, 'type_name', None)}]")
                             
                         captured[p] = arg_node
                     else:
@@ -360,14 +358,15 @@ class Parser:
                             raise SyntaxError(f"Macro pattern expected '{p}', got '{act}' at line {getattr(act, 'line', 'EOF')}:{getattr(act, 'col', 'EOF')}")
                 
                 expanded_body = substitute_ast(rule.body, captured)
-                return ASTNode(NodeType.MacroCall, value=rule.out_name, left=expanded_body, type_name=rule.out_type, line=token.line, col=token.col)
+                
+                # Flag the node with purity based on the rule's mutation status
+                return ASTNode(NodeType.MacroCall, value=rule.out_name, left=expanded_body, type_name=rule.out_type, is_pure=not rule.is_mutating, line=token.line, col=token.col)
             
             except SyntaxError as e:
                 last_error = e
-                self.i = saved_i # BACKTRACK AND TRY NEXT MACRO!
+                self.i = saved_i 
                 
         raise last_error
-
 
     def parse_macro_def(self, token):
         self.match('(')
@@ -386,12 +385,14 @@ class Parser:
                 tok = self.consume()
                 pattern.append(getattr(tok, 'value', str(tok)))
                 
+        # Visible Mutation Guarantee check
+        is_mutating = '=' in pattern
+        
         self.match(':')
         out_name_tok = self.consume(TokenType.IDENTIFIER)
         out_name = out_name_tok.value
         out_type = None
         
-        # Capture return type
         if self.match('['):
             out_type = self.consume(TokenType.IDENTIFIER).value
             self.match(']')
@@ -406,7 +407,6 @@ class Parser:
             if tok.type == TokenType.IDENTIFIER:
                 holes.append(tok.value)
                 
-                # Capture typed arguments dynamically 
                 if self.match('['):
                     t_type = self.consume(TokenType.IDENTIFIER).value
                     hole_types[tok.value] = t_type
@@ -417,7 +417,7 @@ class Parser:
         self.match(':')
         body = self.parse_expr()
         
-        rule = MacroRule(prec, pattern, holes, out_name, body, hole_types, out_type)
+        rule = MacroRule(prec, pattern, holes, out_name, body, hole_types, out_type, is_mutating)
         self.registry.register(rule)
         return ASTNode(NodeType.MacroDef, macro_rule=rule, line=token.line, col=token.col)
 
@@ -432,8 +432,6 @@ class Parser:
         self.match(')')
         return ASTNode(NodeType.Intrinsic, value="asm", children=[ASTNode(NodeType.Identifier, value=inst_name)] + args, line=token.line, col=token.col)
 
-
-# Main Entry Point Function for single-pass contexts (Deprecated, mostly kept for backward compatibility)
 def parse(token_list, registry=None, skip_blocks=False, type_env=None):
     if registry is None: 
         registry = MacroRegistry()
