@@ -25,31 +25,30 @@
 
 // Unary Operators
 @expr(40, !, a) : result = (a) : {
-    val_a = a;
-    @asm(sltu, result, val_a, 1);
+    @asm(sltu, result, a, 1);
 };
 @expr(40, -, a) : result = (a) : {
-    val_a = a;
-    @asm(sub, result, x0, val_a);
+    @asm(sub, result, x0, a);
 };
 
 // Binary Math
-@expr(40, a + b) : result = (a, b) : { 
-    val_a = a; val_b = b; @asm(add, result, val_a, val_b) ;
+@expr(40, a, +, b) : result = (a, b) : { 
+    @asm(add, result, a, b) ;
 };
-@expr(40, a - b) : result = (a, b) : { 
-    val_a = a; val_b = b; @asm(sub, result, val_a, val_b) ;
+@expr(40, a, -, b) : result = (a, b) : { 
+    @asm(sub, result, a, b) ;
 };
 
 // Bitwise Logic
-@expr(20, a | b) : result = (a, b) : { 
-    val_a = a; val_b = b; @asm(or_, result, val_a, val_b) ;
+@expr(20, a, |, b) : result = (a, b) : { 
+    @asm(or_, result, a, b) ;
 };
-@expr(25, a & b) : result = (a, b) : { 
-    val_a = a; val_b = b; @asm(and_, result, val_a, val_b) ;
+@expr(25, a, &, b) : result = (a, b) : { 
+    @asm(and_, result, a, b) ;
 };
-@expr(30, a ^ b ): result = (a, b) : { 
-    val_a = a; val_b = b; @asm(xor, result, val_a, val_b) ;
+@expr(30, a, ^, b ): result = (a, b) : { 
+
+    @asm(xor, result, a, b) ;
 };
 
 // Comparisons
@@ -85,20 +84,14 @@ read_byte : result = (ptr) : {
     val_ptr = ptr;
     @asm(lbu, result, val_ptr, 0) ;
 };
-write_byte : result = (ptr, val) : { 
-    val_ptr = ptr;
-    val_v = val;
-    @asm(sb, val_ptr, 0, val_v);
-    result = val_ptr;
+write_byte : [ptr] = (ptr, val) : { 
+    @asm(sb, ptr, 0, val);
 };
 
 // Array offset calculation (words: base + i * 4)
 arr_addr : result = (ptr, i) : {
-    val_ptr = ptr;
-    val_i = i;
-    i2 = val_i + val_i;
-    offset = i2 + i2;
-    result = val_ptr + offset;
+    offset = i+i+i+i;
+    result = ptr + offset;
 };
 
 

@@ -30,18 +30,26 @@ Both memory lifetimes and language syntax are strictly governed by lexical scope
 * **Loops via Recursion & Runtime Dispatch:** The language does not have `if/else`, `while`, or `for` primitives. Control flow is achieved entirely through Native Pattern Matching. The compiler dynamically emits branching assembly to check values against function overloads at runtime.
 * **Tail Recursion Optimization (TRO):** Loops are heavily enforced natively. A self-recursive call to the current function is intercepted by the compiler, overwriting local frame arguments and jumping directly to the start of the function body without pushing a new return address. This guarantees infinite loops do not overflow the stack.
 
+## 4. Initialization & Control Flow
+* **Zero-Init by Default:** All declared variables are strictly Zero-Initialized by default, preventing undefined behavior.
+* **Dual-Nature Control Flow:** 
+  * **Global Routing (Pattern Matching):** The language does not have built-in `while`, `for`, or `switch` primitives. Function-level control flow is achieved entirely through Native Pattern Matching. The compiler dynamically emits branching assembly (`bne`) to check values against function overloads at runtime.
+  * **Local Branching (Inline Macros):** Local control flow (like `if` or `unless`) can be implemented as **Compile-Time Macros** that inject AST blocks directly into the caller's scope. Because they are expanded inline, they inject native assembly branches (`beq`/`bne`) and still adhere to local visibility of mutation.
+* **Tail Recursion Optimization (TRO):** Loops are heavily enforced natively. A self-recursive call to the current function is intercepted by the compiler, overwriting local frame arguments and jumping directly to the start of the function body without pushing a new return address. This guarantees infinite loops do not overflow the stack.
+
+
 ## 5. Memory Interpretation: The `[view]` Lens & DOD
 Because systems memory is raw bits, the `[ ]` operator acts as a **Lens** instructing the compiler how to interpret, slice, push, and pop data.
 * **Sizing:** `x[int]` (Interpret as a segment)
 * **Pointers:** `[ptr] = sum` (Write to the memory address held in `ptr`)
 * **Data-Oriented Design (DOD):** There are no traditional OOP structs. Data lives in contiguous blocks, and Lenses combined with Splatting (`x, y, z = bytes`) extract, transform, and write back into those blocks using integer offsets.
 
-## 6. The Visible Mutation Guarantee (VMG)
+## 6. The Visible Mutation Guarantee (VMG) & Locality
 The language utilizes **Explicit Mutation**. Functions and expressions are conceptually pure transformations; they yield a result, and state is only updated when explicitly bound via `=`. 
 * **Rule:** A macro (`.@expr`) is **Pure** unless its pattern explicitly contains the `=` symbol.
 * **Pure Macros:** `(a, +, b)` cannot mutate `a` or `b`. If it contains an assembly instruction that writes to memory, or attempts to assign to a variable other than its own return value, the compiler throws a `Visible Mutation Guarantee Violation`.
-* **Mutating Macros:** `(a, =, b)` or `(a, +, =, b)` contain `=`. The compiler grants these macros mutation rights. When reading code, any memory mutation is structurally guaranteed to have a visible `=` sign on that line.
-* **Thunk Exemption:** Block arguments passed into macros (e.g., the body of an `if (cond) { ... }` macro) inherit the *caller's* purity context, not the macro's strict context. This allows a pure macro to safely orchestrate blocks that contain mutations, provided the caller resides in a scope where mutations are natively permitted.
+* **Locality of Mutation (The Thunk Exemption):** AST Blocks (`{ ... }`) passed into macros at compile-time inherit the *caller's* purity context, not the macro's. Because macro blocks are expanded **inline** into the caller's stack frame, they are permitted to mutate local variables. Mutations are deemed safe because they remain hyper-local, share the parent's stack physics (`sp`), and do not hide state behind an opaque pointer.
+
 
 
 ## 7. The Module System
@@ -58,6 +66,11 @@ Note: Full compile‑time evaluation of pure functions with comptime‑known arg
  * Dynamic Dispatch: If arguments are only available at runtime, the compiler emits a runtime branching table.
  * All logic is prioritized for comptime evaluation; only variables dependent on runtime memory state or IO are left to be handled via dynamic assembly dispatch.
 
+## 9. First-Class Functions & The Ban on Closures
+To support advanced Data-Oriented Design (DOD) transformations (like `map`, `filter`, and State Machines), functions can be passed as runtime values. However, to strictly protect the Visible Mutation Guarantee, **Closures are fundamentally banned.**
+* **Pure Function Pointers:** A function passed as a value is strictly a physical memory address of a logic block. 
+* **No Environment Capturing:** A runtime lambda or function value **cannot capture variables from its surrounding lexical scope**. If a function attempts to access a variable not explicitly passed as an argument, it triggers a compile-time error. 
+* **Why?** Closures require hidden heap allocations (environment objects) and introduce silent, non-local state mutations. By enforcing strict purity on function values, the language guarantees that passing a function is as fast and predictable as a native RISC-V `jalr` instruction, with zero hidden side effects.
 
 * **Note on Constant Folding:** Full compile-time evaluation of pure functions or constant algebraic expressions 
 (e.g., evaluating `1 + 2` down to `3` natively without emitting ASM) 

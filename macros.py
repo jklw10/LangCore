@@ -20,7 +20,7 @@ reg_map.update({
     "a0": 10, "a1": 11, "a2": 12, "a3": 13, "a4": 14, "a5": 15, "a6": 16, "a7": 17,
     "s2": 18, "s3": 19, "s4": 20, "s5": 21, "s6": 22, "s7": 23, "s8": 24, "s9": 25, "s10": 26, "s11": 27,
     "t3": 28, "t4": 29, "t5": 30, "t6": 31
-})#todo, define these all  somewhere like macros.py
+})
 imm_positions = {
     "lui": {1}, "jal": {1}, "jalr": {2},
     "beq": {2}, "bne": {2}, "bge": {2},
@@ -28,7 +28,7 @@ imm_positions = {
     "sw": {1}, "sb": {1},
     "addi": {2}, "xori": {2}, "ori": {2}, "andi": {2}, "sltiu": {2},
 }
-no_rd_instructions = {"store", "sw", "sb", "bge", "beq", "bne", "ecall"}                
+no_rd_instructions = {"store", "sw", "sb", "bge", "beq", "bne", "ecall", "label"}                
 #x_ret = 31 #register
 
 #stack ptr is at 2, skip it, i should check if this is universal

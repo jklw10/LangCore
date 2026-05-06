@@ -145,15 +145,11 @@ class Compiler:
                 func_name = current_type_context + func_name
                 
             if node.left.node_type == NodeType.Identifier:
-                ret_var = node.left.value
+                ret_nodes = [node.left]
             elif node.left.node_type == NodeType.Tuple:
-                ret_var = None
-                for c in node.left.children:
-                    if c.node_type == NodeType.Identifier:
-                        ret_var = c.value
-                        break
+                ret_nodes = node.left.children
             else:
-                ret_var = None
+                ret_nodes =[]
                 
             pattern_node = node.right
             
@@ -173,7 +169,7 @@ class Compiler:
             if not already_exists:
                 body = node.children[0]
                 self.function_registry[func_name].append({
-                    'ret_var': ret_var,
+                    'ret_nodes': ret_nodes,
                     'pat_args': pat_args,
                     'label': func_label,
                     'body': body,
@@ -196,8 +192,10 @@ class Compiler:
             if getattr(node, 'right', None):
                 self._register_functions(node.right, current_type_context)
     
-    def _mangle_label(self, func_name, pat_args):
-        parts = [func_name.replace(".", "_")]
+    def _mangle_label(self, func_name, pat_args, line_col=None):
+        parts =[func_name.replace(".", "_")]
+        if line_col:
+            parts.append(f"loc_{line_col[0]}_{line_col[1]}") # Unique per call-site, very cursed, don't care.
         for i, p in enumerate(pat_args):
             if p.node_type == NodeType.Value:
                 parts.append(f"val{p.value}")
@@ -239,14 +237,16 @@ class Compiler:
     def MacroCall(self, node):
         self.enter_scope()
         
+        start_depth = self.current_stack_depth
+        
         old_pure_out_var = self.pure_context_out_var
         self.pure_context_history.append(old_pure_out_var)
         
         if node.is_pure:
-            assert isinstance(node.value, str), "Pure macro must have a string value for its output variable"
+            assert isinstance(node.value, str)
             self.pure_context_out_var = node.value 
         elif old_pure_out_var is not None:
-            raise SyntaxError(f"Visible Mutation Guarantee Violation at {node.line}:{node.col} -> Pure macro cannot invoke a mutating macro.")
+            raise SyntaxError(f"VMG Violation at {node.line}:{node.col}")
 
         macros.push(macros.x0)
         self.current_stack_depth += asm.REGISTER_SIZE
@@ -261,8 +261,11 @@ class Compiler:
         asm.lw(macros.t0, macros.stack_ptr, offset)
         self.exit_scope()
 
-        macros.pop(macros.t1) 
-        self.current_stack_depth -= asm.REGISTER_SIZE
+        diff = self.current_stack_depth - start_depth
+        if diff > 0:
+            asm.addi(macros.stack_ptr, macros.stack_ptr, -diff)
+            self.current_stack_depth = start_depth
+
         macros.push(macros.t0)
         self.current_stack_depth += asm.REGISTER_SIZE
 
@@ -308,44 +311,53 @@ class Compiler:
         elif node.left.node_type == NodeType.Tuple:
             self._compile_node(node.right)
             
-            target_name = None
-            for c in node.left.children:
-                if c.node_type == NodeType.Identifier:
-                    target_name = c.value
-                    break
-                    
-            if target_name:
-                if target_name.startswith(".") and getattr(self, 'current_type_context', None):
-                    target_name = self.current_type_context + target_name
-                    
-                sym = self.get_symbol(target_name)
-                if sym:
-                    macros.pop(macros.t0)
-                    self.current_stack_depth -= asm.REGISTER_SIZE
-                    offset = sym.offset_from_base - self.current_stack_depth
-                    asm.store(macros.stack_ptr, offset, macros.t0)
-                else:
-                    self.declare_symbol(target_name)
-            else:
-                macros.pop(macros.t0)
+            num_targets = len(node.left.children)
+            safe_regs =[18, 19, 20, 21, 22, 23, 24, 25] # s2-s9 (Safe non-volatile storage from clobbering)
+            
+            # Pop all RHS evaluated values right-to-left into safe registers to free up the stack
+            for i in reversed(range(num_targets)):
+                macros.pop(safe_regs[i])
                 self.current_stack_depth -= asm.REGISTER_SIZE
+                
+            for i, target in enumerate(node.left.children):
+                if target.node_type == NodeType.Identifier:
+                    target_name = target.value
+                    if target_name and target_name.startswith(".") and getattr(self, 'current_type_context', None):
+                        target_name = self.current_type_context + target_name
+                        
+                    sym = self.get_symbol(target_name)
+                    if sym:
+                        offset = sym.offset_from_base - self.current_stack_depth
+                        asm.store(macros.stack_ptr, offset, safe_regs[i])
+                    else:
+                        macros.push(safe_regs[i])
+                        self.current_stack_depth += asm.REGISTER_SIZE
+                        self.declare_symbol(target_name)
+                        
+                elif target.node_type == NodeType.Deref:
+                    # Compile pointer expression (safely pushes to freed stack space)
+                    self._compile_node(target.left)
+                    
+                    # Pop pointer
+                    macros.pop(macros.t1)
+                    self.current_stack_depth -= asm.REGISTER_SIZE
+                    
+                    # Store unpacked value directly at the pointer
+                    asm.store(macros.t1, 0, safe_regs[i])
         else:
             raise SyntaxError(f"Syntax Error at line {node.line}:{node.col} -> Invalid assignment target {node.left.node_type.name}")
 
-    
     def FunctionDef(self, node):
         func_name = node.value
         
         if func_name.startswith(".") and getattr(self, 'current_type_context', None):
             func_name = self.current_type_context + func_name
 
-        ret_vars = list()
+        ret_nodes =[]
         if node.left.node_type == NodeType.Identifier:
-            ret_vars.append(node.left.value)
+            ret_nodes = [node.left]
         elif node.left.node_type == NodeType.Tuple:
-            for c in node.left.children:
-                if c.node_type == NodeType.Identifier:
-                    ret_vars.append(c.value)
+            ret_nodes = node.left.children
 
         pattern_node = node.right
         body = node.children[0]
@@ -386,9 +398,11 @@ class Compiler:
         macros.push(macros.x0)
         self.current_stack_depth += asm.REGISTER_SIZE
         
-        ret_syms = list()
-        for rv in ret_vars:
-            ret_syms.append(self.declare_symbol(rv))
+        for rv in ret_nodes:
+            if rv.node_type == NodeType.Identifier:
+                macros.push(macros.x0)
+                self.current_stack_depth += asm.REGISTER_SIZE
+                self.declare_symbol(rv.value)
             
         old_type_ctx = getattr(self, 'current_type_context', None)
         self.current_type_context = func_name
@@ -397,11 +411,17 @@ class Compiler:
         
         self.current_type_context = old_type_ctx
         
-        if ret_syms:
-            offset = ret_syms[0].offset_from_base - self.current_stack_depth
-            asm.lw(macros.t0, macros.stack_ptr, offset)
+        safe_regs =[18, 19, 20, 21, 22, 23, 24, 25] # s2-s9 return transport
+        
+        if ret_nodes:
+            # Process return variables and pack them into outgoing registers
+            for rv in ret_nodes:
+                self._compile_node(rv)
+            for i in reversed(range(len(ret_nodes))):
+                macros.pop(safe_regs[i])
+                self.current_stack_depth -= asm.REGISTER_SIZE
         else:
-            macros.load_immediate(macros.t0, 0)
+            macros.load_immediate(safe_regs[0], 0)
         
         diff = self.current_stack_depth - asm.REGISTER_SIZE
         if diff > 0:
@@ -418,7 +438,7 @@ class Compiler:
         self.current_function_name = old_func_name
         
         asm.label(skip_label)
-
+    
     def Call(self, node):
         func_name = node.value
         call_args = node.children
@@ -426,10 +446,10 @@ class Compiler:
         if func_name.startswith(".") and getattr(self, 'current_type_context', None):
             func_name = self.current_type_context + func_name
             
-        defs = self.function_registry.get(func_name, [])
+        defs = self.function_registry.get(func_name,[])
         
         # Filter matching arity
-        defs =[d for d in defs if len(d['pat_args']) == len(call_args)]
+        defs = [d for d in defs if len(d['pat_args']) == len(call_args)]
         
         if not defs:
             raise ValueError(f"No matching signature for function '{func_name}' with {len(call_args)} args at line {node.line}:{node.col}")
@@ -457,11 +477,9 @@ class Compiler:
                             static_fail = True
                             break
                         else:
-                            # Statically matched this argument! Omit emitting a runtime equality check.
                             continue
                             
                     has_runtime_checks = True
-                    # Dynamically read the evaluated argument from the stack without popping
                     offset_from_top = (len(call_args) - i) * asm.REGISTER_SIZE
                     asm.lw(macros.t0, macros.stack_ptr, -offset_from_top)
                     macros.load_immediate(macros.t1, p.value)
@@ -473,15 +491,18 @@ class Compiler:
             # SUCCESS BLOCK (Branch matched)
             if is_tro:
                 saved_depth = self.current_stack_depth
-                arg_offset_base = -asm.REGISTER_SIZE
                 
-                # Consume stack arguments, replace running frame, and loop natively
-                for _ in reversed(pat_args):
-                    macros.pop(macros.t0)
+                # 1. Pop arguments right-to-left into temporary safe registers first
+                temp_regs =[5, 6, 7, 28, 29, 30, 31][:len(pat_args)]
+                for reg in reversed(temp_regs):
+                    macros.pop(reg)
                     self.current_stack_depth -= asm.REGISTER_SIZE
-                    offset = arg_offset_base - self.current_stack_depth
-                    asm.store(macros.stack_ptr, offset, macros.t0)
-                    arg_offset_base -= asm.REGISTER_SIZE
+                
+                # 2. Store them back into their unique parameter slots on the parent frame
+                for i, reg in enumerate(temp_regs):
+                    offset_from_base = -asm.REGISTER_SIZE * (len(temp_regs) - i)
+                    offset = offset_from_base - self.current_stack_depth
+                    asm.store(macros.stack_ptr, offset, reg)
                     
                 diff = self.current_stack_depth - asm.REGISTER_SIZE
                 if diff > 0:
@@ -495,7 +516,6 @@ class Compiler:
                 
             asm.label(next_def_label)
             
-            # If the candidate was fully verified at compile time, skip evaluating the remaining patterns entirely.
             if not has_runtime_checks:
                 match_found_statically = True
                 break
@@ -505,11 +525,14 @@ class Compiler:
             
         asm.label(end_dispatch_label)
         
+        num_returns = len(defs[0]['ret_nodes']) if defs else 1
+        safe_regs =[18, 19, 20, 21, 22, 23, 24, 25]
+
         if is_tro:
-            # Fake the compile-time state since we escaped via JAL but the AST expects a return value
             self.current_stack_depth -= (len(call_args) * asm.REGISTER_SIZE)
-            macros.push(macros.x0) 
-            self.current_stack_depth += asm.REGISTER_SIZE
+            for _ in range(num_returns if num_returns > 0 else 1):
+                macros.push(macros.x0) 
+                self.current_stack_depth += asm.REGISTER_SIZE
         else:
             # Caller cleanly pops the evaluated arguments it created originally
             num_args = len(call_args)
@@ -517,9 +540,14 @@ class Compiler:
                 asm.addi(macros.stack_ptr, macros.stack_ptr, -(num_args * asm.REGISTER_SIZE))
                 self.current_stack_depth -= (num_args * asm.REGISTER_SIZE)
             
-            # Retrieve callee's returned result left on the stack and push it
-            macros.push(macros.t0)
-            self.current_stack_depth += asm.REGISTER_SIZE
+            # Retrieve callee's returned result left in registers and push them onto the stack
+            if num_returns > 0:
+                for i in range(num_returns):
+                    macros.push(safe_regs[i])
+                    self.current_stack_depth += asm.REGISTER_SIZE
+            else:
+                macros.push(safe_regs[0])
+                self.current_stack_depth += asm.REGISTER_SIZE
 
     def Program(self, node):
         for child in node.children:
@@ -583,57 +611,83 @@ class Compiler:
         store_back_sym = None
         rd_reg_to_push = 0
         
+        eval_args = []
+        
+        # Phase 1: Categorize arguments
         for i, arg in enumerate(node.children[1:]):
             
-            while getattr(arg, 'node_type', None) == NodeType.CallerContext:
-                arg = arg.left
-
-            if inst_name in {"jal", "bge", "beq", "bne"} and i == len(node.children[1:]) - 1:
-                args.append(arg.value if hasattr(arg, 'value') else arg)
+            # Check for branching labels
+            if inst_name in {"jal", "bge", "beq", "bne", "label"} and i == len(node.children[1:]) - 1:
+                eval_args.append({'type': 'literal', 'val': arg.value if hasattr(arg, 'value') else arg})
                 continue
 
-            if getattr(arg, 'node_type', None) == NodeType.Value:
-                val = arg.value
-                if inst_name in imm_positions and i in imm_positions[inst_name]:
-                    args.append(val)
+            # Check for immediates
+            if inst_name in imm_positions and i in imm_positions[inst_name]:
+                if getattr(arg, 'node_type', None) == NodeType.Value:
+                    eval_args.append({'type': 'literal', 'val': arg.value})
                 else:
-                    tmp_reg = temp_pool[temp_idx]
-                    temp_idx += 1
-                    macros.load_immediate(tmp_reg, val)
-                    args.append(tmp_reg)
+                    eval_args.append({'type': 'literal', 'val': getattr(arg, 'value', arg)})
                 continue
-                
-            name = arg.value
-            if name in reg_map:
-                args.append(reg_map[name])
-                if i == 0 and has_rd:
-                    rd_reg_to_push = reg_map[name]
-            else:
-                sym = self.get_symbol(name)
-                is_output = (i == 0 and has_rd)
-                
+
+            # Strip CallerContext wrapper to inspect the raw argument
+            arg_eval = arg
+            while getattr(arg_eval, 'node_type', None) == NodeType.CallerContext:
+                arg_eval = arg_eval.left
+
+            name = getattr(arg_eval, 'value', None)
+            is_output = (i == 0 and has_rd)
+            
+            # Check for direct register usage (e.g., 'zero', 'ra')
+            if isinstance(name, str) and name in reg_map:
+                eval_args.append({'type': 'literal', 'val': reg_map[name]})
                 if is_output:
-                    if not sym:
-                        macros.push(macros.x0)
-                        self.current_stack_depth += asm.REGISTER_SIZE
-                        sym = self.declare_symbol(name)
+                    rd_reg_to_push = reg_map[name]
+                continue
+                
+            # Handle output register allocation (l-value)
+            if is_output:
+                if not isinstance(name, str):
+                    raise ValueError(f"Output of @asm must be an identifier, got {arg_eval.node_type}")
+                sym = self.get_symbol(name)
+                if not sym:
+                    macros.push(macros.x0)
+                    self.current_stack_depth += asm.REGISTER_SIZE
+                    sym = self.declare_symbol(name)
                     
-                    args.append(5) 
-                    store_back_sym = sym
-                    rd_reg_to_push = 5
-                else:
-                    if not sym:
-                        raise ValueError(f"Undefined variable read in @asm: '{name}' at line {node.line}:{node.col}")
-                    
-                    tmp_reg = temp_pool[temp_idx]
-                    temp_idx += 1
-                    offset = sym.offset_from_base - self.current_stack_depth
-                    asm.lw(tmp_reg, macros.stack_ptr, offset)
-                    args.append(tmp_reg)
-                    
+                eval_args.append({'type': 'reg', 'val': 5}) # macros.t0
+                store_back_sym = sym
+                rd_reg_to_push = 5
+            else:
+                # Input argument - schedule for evaluation
+                eval_args.append({'type': 'eval', 'node': arg})
+
+        # Phase 2: Compile inputs sequentially to the stack (prevents clobbering)
+        eval_nodes =[e for e in eval_args if e['type'] == 'eval']
+        for e in eval_nodes:
+            self._compile_node(e['node'])
+            
+        # Phase 3: Pop evaluated results into temporary registers in reverse order
+        for e in reversed(eval_nodes):
+            tmp_reg = temp_pool[temp_idx]
+            temp_idx += 1
+            macros.pop(tmp_reg)
+            self.current_stack_depth -= asm.REGISTER_SIZE
+            e['reg'] = tmp_reg
+            
+        # Phase 4: Construct final argument list
+        for e in eval_args:
+            if e['type'] == 'eval':
+                args.append(e['reg'])
+            elif e['type'] == 'reg':
+                args.append(e['val'])
+            else:
+                args.append(e['val'])
+                
+        # Phase 5: Emit Instruction
         asm_method = getattr(asm, inst_name)
         asm_method(*args)
         
+        # Phase 6: Store output back to memory frame and push to stack for caller
         if store_back_sym:
             offset = store_back_sym.offset_from_base - self.current_stack_depth
             asm.store(macros.stack_ptr, offset, macros.t0)

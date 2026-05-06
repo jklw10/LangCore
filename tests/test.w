@@ -3,12 +3,10 @@ bool : value[bool] = (byte[0:1]):{
     .value = byte;
     // Control Flow (Null-Denotation / Prefix)
     .@expr(2, if, cond, t_body) : out = (cond[bool], t_body) : {
-        runner: _  = (1) : {
-            t_body;
-        };
-        runner: _  = (cond) : {};
-        runner(cond);
-    };
+        @asm(beq, cond, zero, skip_body);
+        t_body;
+        @asm(label, skip_body)
+    }
 };
 
 //Math Operators (Left-Denotation / Infix)
