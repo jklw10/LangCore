@@ -50,7 +50,7 @@ loop : sum[int], [ptr] = (1, i[int], sum[int], ptr) : {
         [ptr] = sum;
     };
 
-    loop(i<10, i + 1, sum, ptr);
+    sum, [ptr] = loop(i<10, i + 1, sum, ptr);
 };
 
 i[int] = 0;

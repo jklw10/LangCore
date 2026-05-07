@@ -233,119 +233,18 @@ class Compiler:
             self.pure_context_history.append(saved_history_val)
             
         self.pure_context_out_var = saved_pure
-
-    def MacroCall(self, node):
-        self.enter_scope()
         
-        start_depth = self.current_stack_depth
-        
-        old_pure_out_var = self.pure_context_out_var
-        self.pure_context_history.append(old_pure_out_var)
-        
-        if node.is_pure:
-            assert isinstance(node.value, str)
-            self.pure_context_out_var = node.value 
-        elif old_pure_out_var is not None:
-            raise SyntaxError(f"VMG Violation at {node.line}:{node.col}")
-
-        macros.push(macros.x0)
-        self.current_stack_depth += asm.REGISTER_SIZE
-        out_sym = self.declare_symbol(node.value)
-        
-        self._compile_node(node.left)
-        
-        self.pure_context_out_var = old_pure_out_var
-        self.pure_context_history.pop()
-
-        offset = out_sym.offset_from_base - self.current_stack_depth
-        asm.lw(macros.t0, macros.stack_ptr, offset)
-        self.exit_scope()
-
-        diff = self.current_stack_depth - start_depth
-        if diff > 0:
-            asm.addi(macros.stack_ptr, macros.stack_ptr, -diff)
-            self.current_stack_depth = start_depth
-
-        macros.push(macros.t0)
-        self.current_stack_depth += asm.REGISTER_SIZE
-
-    def Assignment(self, node):
-        assert self.pure_context_out_var is None or isinstance(self.pure_context_out_var, str), "Invalid pure context state in Assignment"
-        
-        if self.pure_context_out_var is not None:
-            if node.left.node_type == NodeType.Identifier:
-                if node.left.value != self.pure_context_out_var:
-                    raise SyntaxError(f"Visible Mutation Guarantee Violation at {node.line}:{node.col} -> Pure macro cannot mutate external variable '{node.left.value}'")
-            elif node.left.node_type == NodeType.Deref:
-                raise SyntaxError(f"Visible Mutation Guarantee Violation at {node.line}:{node.col} -> Pure macro cannot mutate memory via pointer Deref")
-
-        if node.left.node_type == NodeType.Identifier:
-            name = node.left.value
-            
-            if name and name.startswith(".") and getattr(self, 'current_type_context', None):
-                name = self.current_type_context + name
-                node.left.value = name
-                
-            self._compile_node(node.right)
-            
-            sym = self.get_symbol(name)
-            if sym:
-                macros.pop(macros.t0)
-                self.current_stack_depth -= asm.REGISTER_SIZE
-                offset = sym.offset_from_base - self.current_stack_depth
-                asm.store(macros.stack_ptr, offset, macros.t0)
-            else:
-                self.declare_symbol(name)
-
-        elif node.left.node_type == NodeType.Deref:
-            self._compile_node(node.left.left)
-            self._compile_node(node.right)
-            
-            macros.pop(macros.t0)
-            self.current_stack_depth -= asm.REGISTER_SIZE
-            macros.pop(macros.t1)
-            self.current_stack_depth -= asm.REGISTER_SIZE
-            
-            asm.store(macros.t1, 0, macros.t0)
-            
-        elif node.left.node_type == NodeType.Tuple:
-            self._compile_node(node.right)
-            
-            num_targets = len(node.left.children)
-            safe_regs =[18, 19, 20, 21, 22, 23, 24, 25] # s2-s9 (Safe non-volatile storage from clobbering)
-            
-            # Pop all RHS evaluated values right-to-left into safe registers to free up the stack
-            for i in reversed(range(num_targets)):
-                macros.pop(safe_regs[i])
-                self.current_stack_depth -= asm.REGISTER_SIZE
-                
-            for i, target in enumerate(node.left.children):
-                if target.node_type == NodeType.Identifier:
-                    target_name = target.value
-                    if target_name and target_name.startswith(".") and getattr(self, 'current_type_context', None):
-                        target_name = self.current_type_context + target_name
-                        
-                    sym = self.get_symbol(target_name)
-                    if sym:
-                        offset = sym.offset_from_base - self.current_stack_depth
-                        asm.store(macros.stack_ptr, offset, safe_regs[i])
-                    else:
-                        macros.push(safe_regs[i])
-                        self.current_stack_depth += asm.REGISTER_SIZE
-                        self.declare_symbol(target_name)
-                        
-                elif target.node_type == NodeType.Deref:
-                    # Compile pointer expression (safely pushes to freed stack space)
-                    self._compile_node(target.left)
-                    
-                    # Pop pointer
-                    macros.pop(macros.t1)
-                    self.current_stack_depth -= asm.REGISTER_SIZE
-                    
-                    # Store unpacked value directly at the pointer
-                    asm.store(macros.t1, 0, safe_regs[i])
-        else:
-            raise SyntaxError(f"Syntax Error at line {node.line}:{node.col} -> Invalid assignment target {node.left.node_type.name}")
+    def _ast_nodes_equal(self, n1, n2):
+        if n1 is None and n2 is None: return True
+        if n1 is None or n2 is None: return False
+        if n1.node_type != n2.node_type: return False
+        if n1.value != n2.value: return False
+        if len(n1.children) != len(n2.children): return False
+        for c1, c2 in zip(n1.children, n2.children):
+            if not self._ast_nodes_equal(c1, c2): return False
+        if not self._ast_nodes_equal(n1.left, n2.left): return False
+        if not self._ast_nodes_equal(n1.right, n2.right): return False
+        return True
 
     def FunctionDef(self, node):
         func_name = node.value
@@ -353,9 +252,9 @@ class Compiler:
         if func_name.startswith(".") and getattr(self, 'current_type_context', None):
             func_name = self.current_type_context + func_name
 
-        ret_nodes =[]
+        ret_nodes = []
         if node.left.node_type == NodeType.Identifier:
-            ret_nodes = [node.left]
+            ret_nodes =[node.left]
         elif node.left.node_type == NodeType.Tuple:
             ret_nodes = node.left.children
 
@@ -379,14 +278,15 @@ class Compiler:
         old_func_name = getattr(self, 'current_function_name', None)
         self.current_function_name = func_name
         
+        old_ret_node = getattr(self, 'current_return_node', None)
+        self.current_return_node = node.left
+        
         self.enter_scope()
         old_stack_depth = self.current_stack_depth
         self.current_stack_depth = 0
         
         macros.push(macros.ra)
         self.current_stack_depth += asm.REGISTER_SIZE
-        
-        asm.label(func_label + "_loop")
         
         offset = -asm.REGISTER_SIZE
         for p in reversed(pat_args):
@@ -400,16 +300,32 @@ class Compiler:
         
         for rv in ret_nodes:
             if rv.node_type == NodeType.Identifier:
-                macros.push(macros.x0)
-                self.current_stack_depth += asm.REGISTER_SIZE
-                self.declare_symbol(rv.value)
+                # Check if the return variable is already bound to an argument
+                if rv.value not in self.scopes[-1]:
+                    macros.push(macros.x0)
+                    self.current_stack_depth += asm.REGISTER_SIZE
+                    self.declare_symbol(rv.value)
+
+        # The loop target MUST be placed after all local frame initializations 
+        # to prevent TRO jumps from leaking stack by re-pushing local variables.
+        asm.label(func_label + "_loop")
             
         old_type_ctx = getattr(self, 'current_type_context', None)
         self.current_type_context = func_name
         
+        # Save the true base stack depth of the frame for safe TRO unwinding
+        old_loop_base = getattr(self, 'loop_base_depth', None)
+        self.loop_base_depth = self.current_stack_depth
+        
+        old_lhs = getattr(self, 'current_assignment_lhs', None)
+        self.current_assignment_lhs = None
+        
         self._compile_node(body)
         
+        self.current_assignment_lhs = old_lhs
+        self.loop_base_depth = old_loop_base
         self.current_type_context = old_type_ctx
+        self.current_return_node = old_ret_node
         
         safe_regs =[18, 19, 20, 21, 22, 23, 24, 25] # s2-s9 return transport
         
@@ -438,7 +354,7 @@ class Compiler:
         self.current_function_name = old_func_name
         
         asm.label(skip_label)
-    
+
     def Call(self, node):
         func_name = node.value
         call_args = node.children
@@ -454,13 +370,31 @@ class Compiler:
         if not defs:
             raise ValueError(f"No matching signature for function '{func_name}' with {len(call_args)} args at line {node.line}:{node.col}")
 
+        old_lhs = getattr(self, 'current_assignment_lhs', None)
+        self.current_assignment_lhs = None
+        
         # Push caller args to stack
         for arg in call_args:
             self._compile_node(arg)
             
+        self.current_assignment_lhs = old_lhs
+            
         end_dispatch_label = self.get_unique_label("end_disp")
         match_found_statically = False
-        is_tro = (getattr(self, 'current_function_name', None) == func_name)
+        
+        is_tro = False
+        if getattr(self, 'current_function_name', None) == func_name:
+            ret_node = getattr(self, 'current_return_node', None)
+            lhs_node = getattr(self, 'current_assignment_lhs', None)
+            
+            def is_empty_node(n):
+                return n is None or (n.node_type == NodeType.Tuple and len(n.children) == 0)
+                
+            if is_empty_node(lhs_node) and is_empty_node(ret_node):
+                is_tro = True
+            elif lhs_node is not None and ret_node is not None:
+                if self._ast_nodes_equal(lhs_node, ret_node):
+                    is_tro = True
         
         for definition in defs:
             pat_args = definition['pat_args']
@@ -493,7 +427,8 @@ class Compiler:
                 saved_depth = self.current_stack_depth
                 
                 # 1. Pop arguments right-to-left into temporary safe registers first
-                temp_regs =[5, 6, 7, 28, 29, 30, 31][:len(pat_args)]
+                # Expanding array size to safely accommodate functions with up to 15 arguments
+                temp_regs =[5, 6, 7, 28, 29, 30, 31, 10, 11, 12, 13, 14, 15, 16, 17][:len(pat_args)]
                 for reg in reversed(temp_regs):
                     macros.pop(reg)
                     self.current_stack_depth -= asm.REGISTER_SIZE
@@ -504,7 +439,8 @@ class Compiler:
                     offset = offset_from_base - self.current_stack_depth
                     asm.store(macros.stack_ptr, offset, reg)
                     
-                diff = self.current_stack_depth - asm.REGISTER_SIZE
+                # Calculate difference to the true loop frame base, NOT a hardcoded 4 bytes
+                diff = self.current_stack_depth - getattr(self, 'loop_base_depth', asm.REGISTER_SIZE)
                 if diff > 0:
                     asm.addi(macros.stack_ptr, macros.stack_ptr, -diff)
                     
@@ -549,21 +485,171 @@ class Compiler:
                 macros.push(safe_regs[0])
                 self.current_stack_depth += asm.REGISTER_SIZE
 
-    def Program(self, node):
-        for child in node.children:
-            self._compile_node(child)
-        asm.ecall()
+    def Assignment(self, node):
+        assert self.pure_context_out_var is None or isinstance(self.pure_context_out_var, str), "Invalid pure context state in Assignment"
+        
+        old_lhs = getattr(self, 'current_assignment_lhs', None)
+        self.current_assignment_lhs = node.left
+
+        if self.pure_context_out_var is not None:
+            if node.left.node_type == NodeType.Identifier:
+                if node.left.value != self.pure_context_out_var:
+                    raise SyntaxError(f"Visible Mutation Guarantee Violation at {node.line}:{node.col} -> Pure macro cannot mutate external variable '{node.left.value}'")
+            elif node.left.node_type == NodeType.Deref:
+                raise SyntaxError(f"Visible Mutation Guarantee Violation at {node.line}:{node.col} -> Pure macro cannot mutate memory via pointer Deref")
+
+        if node.left.node_type == NodeType.Identifier:
+            name = node.left.value
+            
+            if name and name.startswith(".") and getattr(self, 'current_type_context', None):
+                name = self.current_type_context + name
+                node.left.value = name
+                
+            self._compile_node(node.right)
+            
+            sym = self.get_symbol(name)
+            if sym:
+                macros.pop(macros.t0)
+                self.current_stack_depth -= asm.REGISTER_SIZE
+                offset = sym.offset_from_base - self.current_stack_depth
+                asm.store(macros.stack_ptr, offset, macros.t0)
+            else:
+                self.declare_symbol(name)
+
+        elif node.left.node_type == NodeType.Deref:
+            self.current_assignment_lhs = None
+            self._compile_node(node.left.left)
+            self.current_assignment_lhs = node.left
+            
+            self._compile_node(node.right)
+            
+            macros.pop(macros.t0)
+            self.current_stack_depth -= asm.REGISTER_SIZE
+            macros.pop(macros.t1)
+            self.current_stack_depth -= asm.REGISTER_SIZE
+            
+            asm.store(macros.t1, 0, macros.t0)
+            
+        elif node.left.node_type == NodeType.Tuple:
+            self._compile_node(node.right)
+            
+            num_targets = len(node.left.children)
+            safe_regs =[18, 19, 20, 21, 22, 23, 24, 25] # s2-s9 (Safe non-volatile storage from clobbering)
+            
+            # Pop all RHS evaluated values right-to-left into safe registers to free up the stack
+            for i in reversed(range(num_targets)):
+                macros.pop(safe_regs[i])
+                self.current_stack_depth -= asm.REGISTER_SIZE
+                
+            for i, target in enumerate(node.left.children):
+                if target.node_type == NodeType.Identifier:
+                    target_name = target.value
+                    if target_name and target_name.startswith(".") and getattr(self, 'current_type_context', None):
+                        target_name = self.current_type_context + target_name
+                        
+                    sym = self.get_symbol(target_name)
+                    if sym:
+                        offset = sym.offset_from_base - self.current_stack_depth
+                        asm.store(macros.stack_ptr, offset, safe_regs[i])
+                    else:
+                        macros.push(safe_regs[i])
+                        self.current_stack_depth += asm.REGISTER_SIZE
+                        self.declare_symbol(target_name)
+                        
+                elif target.node_type == NodeType.Deref:
+                    # Protect RHS values in safe_regs from being clobbered by target.left evaluation
+                    for r in range(num_targets):
+                        macros.push(safe_regs[r])
+                        self.current_stack_depth += asm.REGISTER_SIZE
+                    
+                    # Compile pointer expression (safely pushes to freed stack space)
+                    self.current_assignment_lhs = None
+                    self._compile_node(target.left)
+                    self.current_assignment_lhs = node.left
+                    
+                    # Pop pointer
+                    macros.pop(macros.t1)
+                    self.current_stack_depth -= asm.REGISTER_SIZE
+                    
+                    # Restore RHS values
+                    for r in reversed(range(num_targets)):
+                        macros.pop(safe_regs[r])
+                        self.current_stack_depth -= asm.REGISTER_SIZE
+                    
+                    # Store unpacked value directly at the pointer
+                    asm.store(macros.t1, 0, safe_regs[i])
+        else:
+            raise SyntaxError(f"Syntax Error at line {node.line}:{node.col} -> Invalid assignment target {node.left.node_type.name}")
+            
+        self.current_assignment_lhs = old_lhs
 
     def Block(self, node):
         self.enter_scope()
         start_depth = self.current_stack_depth
-        for child in node.children:
+        
+        old_lhs = getattr(self, 'current_assignment_lhs', None)
+        
+        for i, child in enumerate(node.children):
+            if i < len(node.children) - 1:
+                self.current_assignment_lhs = None
+            else:
+                self.current_assignment_lhs = old_lhs
+                
             self._compile_node(child)
+            
+        self.current_assignment_lhs = old_lhs
+        
         diff = self.current_stack_depth - start_depth
         if diff > 0:
             asm.addi(macros.stack_ptr, macros.stack_ptr, -diff)
             self.current_stack_depth = start_depth
         self.exit_scope()
+
+    def MacroCall(self, node):
+        self.enter_scope()
+        
+        start_depth = self.current_stack_depth
+        
+        old_pure_out_var = self.pure_context_out_var
+        self.pure_context_history.append(old_pure_out_var)
+        
+        if node.is_pure:
+            assert isinstance(node.value, str)
+            self.pure_context_out_var = node.value 
+        elif old_pure_out_var is not None:
+            raise SyntaxError(f"VMG Violation at {node.line}:{node.col}")
+
+        macros.push(macros.x0)
+        self.current_stack_depth += asm.REGISTER_SIZE
+        out_sym = self.declare_symbol(node.value)
+        
+        old_lhs = getattr(self, 'current_assignment_lhs', None)
+        self.current_assignment_lhs = None
+        
+        self._compile_node(node.left)
+        
+        self.current_assignment_lhs = old_lhs
+        
+        self.pure_context_out_var = old_pure_out_var
+        self.pure_context_history.pop()
+
+        offset = out_sym.offset_from_base - self.current_stack_depth
+        asm.lw(macros.t0, macros.stack_ptr, offset)
+        self.exit_scope()
+
+        diff = self.current_stack_depth - start_depth
+        if diff > 0:
+            asm.addi(macros.stack_ptr, macros.stack_ptr, -diff)
+            self.current_stack_depth = start_depth
+
+        macros.push(macros.t0)
+        self.current_stack_depth += asm.REGISTER_SIZE
+
+    def Program(self, node):
+        for child in node.children:
+            self._compile_node(child)
+        asm.ecall()
+
 
     def MacroDef(self, node):
         pass
