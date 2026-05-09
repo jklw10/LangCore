@@ -2,7 +2,7 @@ import ctypes
 import os
 import glob
 import traceback
-import macros
+import platform
 import compiler
 import disasm 
 
@@ -31,10 +31,10 @@ def load_cpu_lib():
 def compile_file(filepath):
     """Compiles a single .w file and returns the binary."""
     # Reset the global assembler state from macros to prevent code merging
-    macros.asm.code = bytearray()
-    macros.asm.labels = {}
-    macros.asm.fixups = {}
-    macros.asm.pc = 0
+    platform.asm.code = bytearray()
+    platform.asm.labels = {}
+    platform.asm.fixups = {}
+    platform.asm.pc = 0
     
     # 4-Pass Compilation using the new Workspace implementation
     workspace = compiler.Workspace()
