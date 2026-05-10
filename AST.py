@@ -85,7 +85,9 @@ class MacroRegistry:
 
 def build_type_name(node):
     """Safely constructs a string representation of complex AST types like [0:1]"""
-    if not node: return ""
+    assert node is None or isinstance(node, ASTNode) or isinstance(node, str), f"build_type_name expected ASTNode or str, got {type(node)}"
+    
+    #if not node: return ""
     if getattr(node, 'node_type', None) == NodeType.Identifier: return node.value
     if getattr(node, 'node_type', None) == NodeType.Value: return str(node.value)
     if getattr(node, 'node_type', None) == NodeType.Pipeline:
@@ -95,39 +97,46 @@ def build_type_name(node):
     return str(getattr(node, 'value', node))
 
 def substitute_ast(node, captured):
+    assert isinstance(captured, dict), f"substitute_ast requires a dictionary of captured bindings, got {type(captured)}"
     if node is None:
         return None
         
     if hasattr(node, 'value') and not isinstance(node, ASTNode):
         if node.value in captured:
             copied = copy.deepcopy(captured[node.value])
+            assert isinstance(copied, ASTNode), "Captured value to substitute must be an ASTNode"
             return ASTNode(NodeType.CallerContext, left=copied, line=getattr(node, 'line', 0), col=getattr(node, 'col', 0))
         return node
         
     if isinstance(node, ASTNode) and node.node_type == NodeType.Identifier:
         if node.value in captured:
             copied = copy.deepcopy(captured[node.value])
+            assert isinstance(copied, ASTNode), "Captured value to substitute must be an ASTNode"
             return ASTNode(NodeType.CallerContext, left=copied, line=node.line, col=node.col)
             
     new_node = copy.copy(node) 
     if getattr(new_node, 'left', None):
         new_node.left = substitute_ast(new_node.left, captured)
+        assert isinstance(new_node.left, ASTNode), "Substituted left child must be an ASTNode"
     if getattr(new_node, 'right', None):
         new_node.right = substitute_ast(new_node.right, captured)
+        assert isinstance(new_node.right, ASTNode), "Substituted right child must be an ASTNode"
     if getattr(new_node, 'children', None):
-        new_node.children =[substitute_ast(c, captured) for c in new_node.children]
+        new_node.children = [substitute_ast(c, captured) for c in new_node.children]
+        assert all(isinstance(c, ASTNode) for c in new_node.children), "All substituted children must be ASTNodes"
         
     return new_node
 
 
 class Parser:
-    def __init__(self, token_list, registry, skip_blocks=False, type_env=None, exported_macros=None):
+    def __init__(self, token_list, registry, skip_blocks=False, type_env=None, exported_macros=None, import_callback=None):
         self.tokens = token_list
         self.i = 0
         self.registry = registry
         self.skip_blocks = skip_blocks
         self.type_scopes = [type_env.copy() if type_env else {}]
         self.exported_macros = exported_macros if exported_macros is not None else {}
+        self.import_callback = import_callback
 
     def declare_type(self, name, type_name):
         if name and type_name:
@@ -170,9 +179,13 @@ class Parser:
         return True
     
     def consume(self, expected_type: TokenType = None):
+        assert expected_type is None or isinstance(expected_type, TokenType), f"consume expected TokenType Enum, got {type(expected_type)}"
+        assert self.i >= 0, f"Token index out of bounds: {self.i}"
+
         if self.i >= len(self.tokens): return None
         t = self.tokens[self.i]
-        
+        assert hasattr(t, 'type') and hasattr(t, 'line') and hasattr(t, 'col'), "Token object is missing required attributes"
+
         if t.type == TokenType.EOF:
             if expected_type:
                 raise SyntaxError(f"Unexpected EOF waiting for {expected_type.name}")
@@ -185,6 +198,7 @@ class Parser:
         return t
 
     def match(self, sym_str):
+        assert isinstance(sym_str, str), f"match() requires a string symbol, got {type(sym_str)}"
         t = self.peek()
         if t and t.type == TokenType.SYMBOL and t.value == sym_str:
             self.i += 1
@@ -192,6 +206,9 @@ class Parser:
         return False
 
     def get_led_prec(self, t):
+        assert t is not None, "get_led_prec cannot evaluate a None token"
+        assert hasattr(t, 'type') and hasattr(t, 'value'), "get_led_prec requires a valid Token object"
+        
         if (t.type == TokenType.SYMBOL):
             if t.value == '=': return 5   
             if t.value == ',': return 6  
@@ -206,23 +223,32 @@ class Parser:
         return 0
 
     def parse_program(self):
+        assert self.tokens is not None, "Parser initialized without tokens"
         root = ASTNode(NodeType.Program, line=1, col=1)
         while self.peek():
             stmt = self.parse_expr()
             if stmt: 
+                assert isinstance(stmt, ASTNode), f"parse_expr() must return an ASTNode, got {type(stmt)}"
                 root.children.append(stmt)
             self.match(';')
         return root
 
     def parse_expr(self, rbp=0):
+        assert isinstance(rbp, (int, float)) and rbp >= 0, f"Right-binding power must be non-negative, got {rbp}"
+        
         t = self.consume()
         if not t: return None
+        
         left = self.nud(t)
+        assert left is None or isinstance(left, ASTNode), f"nud() must return an ASTNode or None, got {type(left)}"
         
         while True:
             next_t = self.peek()
             if not next_t: break
+            
             prec = self.get_led_prec(next_t)
+            assert isinstance(prec, (int, float)) and prec >= 0, f"Precedence must be a non-negative number, got {prec}"
+            
             if prec == 0 or rbp >= prec: break
             
             if next_t.value == '(' and getattr(left, 'node_type', None) != NodeType.Identifier:
@@ -230,10 +256,14 @@ class Parser:
                 
             self.consume()
             left = self.led(left, next_t, prec)
+            assert isinstance(left, ASTNode), f"led() must return an ASTNode, got {type(left)}"
             
         return left
 
     def nud(self, t):
+        assert t is not None, "nud() called with None token"
+        assert hasattr(t, 'type') and hasattr(t, 'value'), "nud() requires a valid Token object"
+        
         if (t.type == TokenType.SYMBOL):
             if t.value == '{':
                 block = ASTNode(NodeType.Block, line=t.line, col=t.col)
@@ -248,13 +278,17 @@ class Parser:
                     return block
 
                 self.registry.push_scope()
-                
                 self.type_scopes.append(self.type_scopes[-1].copy()) 
+                
                 while self.peek() and not getattr(self.peek(), 'value', None) == '}':
                     stmt = self.parse_expr()
-                    if stmt: block.children.append(stmt)
+                    if stmt: 
+                        assert isinstance(stmt, ASTNode), f"Block child must be an ASTNode, got {type(stmt)}"
+                        block.children.append(stmt)
                     self.match(';') 
-                self.consume()
+                
+                closing_brace = self.consume()
+                assert closing_brace is not None and closing_brace.value == '}', "Block did not end with '}'"
                 
                 captured_nud = {k: list(v) for k, v in self.registry.nud_rules[-1].items()}
                 captured_led = {k: list(v) for k, v in self.registry.led_rules[-1].items()}
@@ -269,18 +303,22 @@ class Parser:
                     self.consume()
                     return ASTNode(NodeType.Tuple, children=[], line=t.line, col=t.col)
                 expr = self.parse_expr(0)
+                assert expr is not None, "Empty expression inside parentheses"
                 self.match(')')
                 return expr
 
             if t.value == '[':
                 expr = self.parse_expr()
+                assert expr is not None, "Deref requires a valid expression inside brackets"
                 self.match(']')
                 return ASTNode(NodeType.Deref, left=expr, line=t.line, col=t.col)
                 
             if t.value == '.':
                 next_t = self.consume()
+                assert next_t is not None, "Unexpected EOF after '.'"
                 if getattr(next_t, 'value', None) == '@':
                     name_t = self.consume(TokenType.IDENTIFIER)
+                    assert name_t is not None, "Expected identifier after '.@'"
                     if name_t.value == 'expr':
                         return self.parse_macro_def(name_t)
                     elif name_t.value == 'asm':
@@ -293,18 +331,24 @@ class Parser:
                 
             if t.value == '@':
                 next_t = self.consume(TokenType.IDENTIFIER)
+                assert next_t is not None, "Expected identifier after '@'"
                 if next_t.value == 'expr':
                     return self.parse_macro_def(t)
                 elif next_t.value == 'asm':
                     return self.parse_asm_intrinsic(t)
                 elif next_t.value in ('import', 'embed', 'using'):
                     self.match('(')
-                    path_tokens =[]
+                    path_tokens = []
                     while self.peek() and not getattr(self.peek(), 'value', None) == ')':
                         path_tokens.append(str(getattr(self.consume(), 'value', '')))
                     self.match(')')
                     
                     path_str = "".join(path_tokens)
+                    assert path_str, "Path string cannot be empty in import/embed/using"
+                    
+                    if next_t.value == 'import' and self.import_callback:
+                        assert isinstance(path_str, str) and path_str, "Macro import bounds structurally require validated file mapping paths"
+                        self.import_callback(path_str)
                     
                     if next_t.value == 'using' and path_str in self.exported_macros:
                         cnud, cled = self.exported_macros[path_str]
@@ -336,16 +380,22 @@ class Parser:
 
         raise SyntaxError(f"Unexpected token {t} at line {t.line}:{t.col}")
     
+    
     def led(self, left, t, prec):
+        assert left is not None and isinstance(left, ASTNode), "led() requires a valid left ASTNode"
+        assert t is not None, "led() called with None token"
+        assert isinstance(prec, (int, float)) and prec > 0, "led() called with invalid precedence"
+
         if (t.type == TokenType.SYMBOL):
             if t.value == '(':
                 args = list()
                 if self.peek() and getattr(self.peek(), 'value', None) != ')':
                     arg_node = self.parse_expr(0)
+                    assert arg_node is not None, "Call arguments cannot be empty if parentheses are open"
                     if getattr(arg_node, 'node_type', None) == NodeType.Tuple:
                         args = arg_node.children
                     else:
-                        args =[arg_node]
+                        args = [arg_node]
                 self.match(')')
                 
                 if left.node_type == NodeType.Identifier:
@@ -357,9 +407,11 @@ class Parser:
 
             if t.value == '[':
                 type_expr = self.parse_expr(0)
+                assert type_expr is not None, "Type annotation bracket cannot be empty"
                 self.match(']')
                 
                 type_name = build_type_name(type_expr)
+                assert type_name, "Failed to resolve type name from annotation"
                 left.type_name = type_name
                 
                 if left.node_type == NodeType.Identifier:
@@ -368,6 +420,7 @@ class Parser:
 
             if t.value == '=':
                 right = self.parse_expr(prec - 1)
+                assert right is not None, "Assignment requires a valid right-hand expression"
                 
                 is_func = False
                 func_name = None
@@ -389,6 +442,7 @@ class Parser:
 
                 if is_func:
                     if right.node_type == NodeType.Pipeline and right.right.node_type == NodeType.Block:
+                        assert ret_node is not None, "Function definition requires valid return mapping"
                         func_node = ASTNode(NodeType.FunctionDef, 
                                        value=func_name, 
                                        left=ret_node, 
@@ -405,10 +459,12 @@ class Parser:
 
             if t.value == ':':
                 right = self.parse_expr(prec - 1)
+                assert right is not None, "Pipeline operator requires a valid right-hand expression"
                 return ASTNode(NodeType.Pipeline, left=left, right=right, line=t.line, col=t.col)
             
             if t.value == ',':
                 right = self.parse_expr(prec)
+                assert right is not None, "Tuple separator requires a valid right-hand expression"
                 if left.node_type == NodeType.Tuple:
                     left.children.append(right)
                     return left
@@ -416,6 +472,7 @@ class Parser:
                 
             if t.value == '.':
                 right_t = self.consume(TokenType.IDENTIFIER)
+                assert right_t is not None, "Property access dot '.' requires a following identifier"
                 if left.node_type == NodeType.Identifier:
                     combined = left.value + "." + right_t.value
                     node = ASTNode(NodeType.Identifier, value=combined, line=t.line, col=t.col)
@@ -425,18 +482,23 @@ class Parser:
                 
             rules = self.registry.get_led(t.value)
             if rules:
-                valid_rules =[r for r in rules if r.prec == prec]
+                valid_rules = [r for r in rules if r.prec == prec]
                 if valid_rules:
                     return self.expand_macro(valid_rules, t, left)
 
         raise SyntaxError(f"Unexpected infix operator {t} at line {t.line}:{t.col}")
 
     def expand_macro(self, rule_list, token, left):
+        assert rule_list, "expand_macro called with an empty rule_list"
+        assert token is not None, "expand_macro requires a valid trigger token"
+        assert left is None or isinstance(left, ASTNode), "expand_macro left operand must be an ASTNode"
+
         if not isinstance(rule_list, list):
             rule_list = [rule_list]
             
         last_error = None
         for rule in rule_list:
+            assert hasattr(rule, 'pattern') and hasattr(rule, 'holes') and hasattr(rule, 'body'), "MacroRule is missing required fields"
             saved_i = self.i
             try:
                 captured = {}
@@ -451,7 +513,10 @@ class Parser:
                 
                 for p in rule.pattern[start_idx:]:
                     if p in rule.holes:
+                        assert isinstance(rule.prec, (int, float)), f"MacroRule {rule.out_name} has invalid precedence {rule.prec}"
                         arg_node = self.parse_expr(rule.prec)
+                        assert arg_node is not None, f"Macro expected an expression for hole '{p}' but got nothing"
+                        
                         expected_type = rule.hole_types.get(p)
                         
                         if expected_type and getattr(arg_node, 'type_name', None) and getattr(arg_node, 'type_name', None) != expected_type:
@@ -464,6 +529,7 @@ class Parser:
                             raise SyntaxError(f"Macro pattern expected '{p}', got '{act}' at line {getattr(act, 'line', 'EOF')}:{getattr(act, 'col', 'EOF')}")
                 
                 expanded_body = substitute_ast(rule.body, captured)
+                assert isinstance(expanded_body, ASTNode) or expanded_body is None, "Macro expansion failed to produce a valid ASTNode"
                 
                 return ASTNode(NodeType.MacroCall, value=rule.out_name, left=expanded_body, type_name=rule.out_type, is_pure=not rule.is_mutating, line=token.line, col=token.col)
             
@@ -474,10 +540,14 @@ class Parser:
         raise last_error
     
     def parse_macro_def(self, token):
-        self.match('(')
-        prec = self.consume(TokenType.VALUE).value
+        assert token is not None, "parse_macro_def requires a valid trigger token"
         
-        pattern =[]
+        self.match('(')
+        prec_tok = self.consume(TokenType.VALUE)
+        assert prec_tok is not None, "Macro definition missing precedence value"
+        prec = prec_tok.value
+        
+        pattern = []
         if self.match(','):
             while self.peek() and not getattr(self.peek(), 'value', None) == ')':
                 tok = self.consume()
@@ -490,21 +560,24 @@ class Parser:
                 tok = self.consume()
                 pattern.append(getattr(tok, 'value', str(tok)))
                 
+        assert len(pattern) > 0, "Macro definition must have at least one token in its pattern"
         is_mutating = any(p == '=' for p in pattern)
         
         self.match(':')
         out_name_tok = self.consume(TokenType.IDENTIFIER)
+        assert out_name_tok is not None, "Macro definition missing output name"
         out_name = out_name_tok.value
         out_type = None
         
         if self.match('['):
             out_type_node = self.parse_expr(0)
+            assert out_type_node is not None, "Macro output type definition cannot be empty"
             out_type = build_type_name(out_type_node)
             self.match(']')
             
         self.match('=')
         self.match('(')
-        holes =[]
+        holes = []
         hole_types = {}
         
         while self.peek() and not getattr(self.peek(), 'value', None) == ')':
@@ -514,6 +587,7 @@ class Parser:
                 
                 if self.match('['):
                     t_type_node = self.parse_expr(0)
+                    assert t_type_node is not None, f"Type annotation for hole '{tok.value}' cannot be empty"
                     hole_types[tok.value] = build_type_name(t_type_node)
                     self.match(']')
             elif tok.type == TokenType.SYMBOL and tok.value == ',':
@@ -522,24 +596,34 @@ class Parser:
         self.match(')') 
         self.match(':')
         body = self.parse_expr()
+        assert body is not None, "Macro body expression cannot be empty"
+        
+        # Enforce Visible Mutation Guarantee: If macro doesn't have '=', block must be pure
+        #if not is_mutating and not body.is_body_pure():
+        #    raise SyntaxError(f"Visible Mutation Guarantee Violation at line {token.line}:{token.col} -> Macro pattern is marked pure but body contains mutations")
         
         rule = MacroRule(prec, pattern, holes, out_name, body, hole_types, out_type, is_mutating)
         self.registry.register(rule)
         return ASTNode(NodeType.MacroDef, macro_rule=rule, line=token.line, col=token.col)
 
     def parse_asm_intrinsic(self, token):
+        assert token is not None, "parse_asm_intrinsic requires a valid token"
         self.match('(')
-        inst_name = self.consume(TokenType.IDENTIFIER).value
-        args =[]
+        inst_name_tok = self.consume(TokenType.IDENTIFIER)
+        assert inst_name_tok is not None, "@asm requires an instruction name"
+        inst_name = inst_name_tok.value
+        args = []
         while self.peek() and not getattr(self.peek(), 'value', None) == ')':
             if self.match(','): 
                 continue
-            args.append(self.parse_expr(30))
+            arg_expr = self.parse_expr(30)
+            assert arg_expr is not None, "Failed to parse argument in @asm intrinsic"
+            args.append(arg_expr)
         self.match(')')
         return ASTNode(NodeType.Intrinsic, value="asm", children=[ASTNode(NodeType.Identifier, value=inst_name)] + args, line=token.line, col=token.col)
 
-def parse(token_list, registry=None, skip_blocks=False, type_env=None, exported_macros=None):
+def parse(token_list, registry=None, skip_blocks=False, type_env=None, exported_macros=None, import_callback=None):
     if registry is None: 
         registry = MacroRegistry()
-    p = Parser(token_list, registry, skip_blocks, type_env, exported_macros)
+    p = Parser(token_list, registry, skip_blocks, type_env, exported_macros, import_callback)
     return p.parse_program()

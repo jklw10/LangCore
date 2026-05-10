@@ -43,7 +43,8 @@ class Workspace:
         token_list = tokens.tokenize(source)
         
         # Pass 1: Parse everything (no skipping) to extract Types AND Macros
-        parser = AST.Parser(token_list, self.macro_registry, skip_blocks=False, type_env=self.global_types, exported_macros=self.global_macros)
+        # Passing self.discover_file as import_callback allows AST to synchronously resolve dependencies and their macros inline!
+        parser = AST.Parser(token_list, self.macro_registry, skip_blocks=False, type_env=self.global_types, exported_macros=self.global_macros, import_callback=self.discover_file)
         ast_skeleton = parser.parse_program()
         
         assert ast_skeleton is not None, f"Lexical parser failed to generate a valid AST skeleton for {filepath}"
@@ -52,7 +53,13 @@ class Workspace:
     def _extract_signatures(self, node, current_filepath, current_type=None):
         if not node: 
             return
-        
+            
+        if node.node_type == NodeType.Intrinsic and node.value == "import":
+            assert len(node.children) == 1, "Import intrinsic explicitly requires exactly one path parameter argument"
+            assert isinstance(node.children[0].value, str) and node.children[0].value, "Import logically mandates structurally defined path literal string mapping external logic sources"
+            self.discover_file(node.children[0].value)
+            return
+            
         if node.node_type == NodeType.FunctionDef:
             assert isinstance(node.value, str) and node.value, "Function definition must possess a structural name string"
             
@@ -80,6 +87,7 @@ class Workspace:
             if getattr(node, 'right', None):
                 self._extract_signatures(node.right, current_filepath, current_type)
 
+
     def semantic_parse_file(self, filepath):
         assert filepath in self.loaded_files, f"Cannot semantic parse un-discovered file: {filepath}"
         
@@ -88,7 +96,9 @@ class Workspace:
             
         token_list = tokens.tokenize(source)
         
-        parser = AST.Parser(token_list, self.macro_registry, skip_blocks=False, type_env=self.global_types.copy(), exported_macros=self.global_macros)
+        # During the semantic pass, the global_macros mapping is already fully baked from Pass 1,
+        # so we pass None to skip unnecessarily repeating the synchronous IO callback overhead.
+        parser = AST.Parser(token_list, self.macro_registry, skip_blocks=False, type_env=self.global_types.copy(), exported_macros=self.global_macros, import_callback=None)
         ast_full = parser.parse_program()
         
         assert ast_full is not None, "Semantic parser failed to construct a final AST framework"
@@ -955,14 +965,20 @@ class Compiler:
         
         for i, arg in enumerate(node.children[1:]):
             if inst_name in {"jal", "bge", "beq", "bne", "label"} and i == len(node.children[1:]) - 1:
-                eval_args.append({'type': 'literal', 'val': arg.value if hasattr(arg, 'value') else arg})
+                val = arg.value if hasattr(arg, 'value') else arg
+                assert isinstance(val, (str, int)), f"Branch jump targets physically mandate resolution maps against strings or offsets, breaching mapping logic with '{val}'"
+                eval_args.append({'type': 'literal', 'val': val})
                 continue
 
             if inst_name in imm_positions and i in imm_positions[inst_name]:
                 if getattr(arg, 'node_type', None) == NodeType.Value:
-                    eval_args.append({'type': 'literal', 'val': arg.value})
+                    val = arg.value
                 else:
-                    eval_args.append({'type': 'literal', 'val': getattr(arg, 'value', arg)})
+                    val = getattr(arg, 'value', arg)
+                    
+                assert isinstance(val, int), f"Instruction map formally binds '{inst_name}' argument {i} to static numeric immediates, immediately rejecting invalid mapped variable/string '{val}'."
+                
+                eval_args.append({'type': 'literal', 'val': val})
                 continue
 
             arg_eval = arg
@@ -1014,6 +1030,12 @@ class Compiler:
             else:
                 args.append(e['val'])
                 
+        # NEGATIVE SPACE PROGRAMMING: Prevent any structural string bleed into raw hardware functions
+        for idx, a in enumerate(args):
+            if inst_name in {"jal", "bge", "beq", "bne", "label"} and idx == len(args) - 1:
+                continue
+            assert isinstance(a, int), f"Execution hardware map categorically rejects non-integer binding payload at arg {idx} for '{inst_name}', completely breaking physical constraints. Received '{a}'"
+                
         asm_method = getattr(asm, inst_name)
         assert asm_method is not None, f"Dynamic instruction bounds map physically crashed entirely locating absolutely no target sequence parameters executing {inst_name}"
         asm_method(*args)
@@ -1041,7 +1063,7 @@ class Compiler:
             # STRICT CONTROL FLOW ASSERT:
             assert rd_reg_to_push == 0, "Execution logically bounded structural limits explicitly restricting returning payload blocks bypassing safe branch mappings unconditionally"
             assert inst_name in {"store", "sw", "sb", "bge", "beq", "bne", "ecall", "label"}, "Volatile bypass safety assertion caught invalid instruction escaping RD bounds requirement"
-            
+        
     def Tuple(self, node):
         assert node.node_type == NodeType.Tuple, "Execution parameter sequence requires physically standard map logic directly translating entirely targeting tuple sequences exactly"
         for child in node.children:

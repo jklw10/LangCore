@@ -135,6 +135,7 @@ class RiscVAssembler:
         
     def sb(self, rs1, offset, rs2):
         self._s_type(0x23, rs1, rs2, offset, 0x0)
+        
     # --- Branching ---
     def jal(self, rd, label):
         offset = self._resolve_or_record(label, 'J')
