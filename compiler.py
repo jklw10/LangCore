@@ -141,6 +141,8 @@ class Compiler:
         self.pure_context_out_var = None
         self.pure_context_history =[]
         self.comptime_evaluator = None 
+        self.macro_expansion_counter = 0
+        self.macro_expansion_stack = []
 
     def enter_scope(self):
         assert isinstance(self.scopes, list), "Scope stack framework lost structural integrity"
@@ -763,6 +765,10 @@ class Compiler:
         self.enter_scope()
         start_depth = self.current_stack_depth
         
+        # Track macro invocation for local inline label generation
+        self.macro_expansion_counter += 1
+        self.macro_expansion_stack.append(self.macro_expansion_counter)
+        
         old_pure_out_var = self.pure_context_out_var
         self.pure_context_history.append(old_pure_out_var)
         
@@ -776,7 +782,6 @@ class Compiler:
         self.current_stack_depth += asm.REGISTER_SIZE
         out_sym = self.declare_symbol(node.value)
         
-        # FIX: The symbol now accurately registers -asm.REGISTER_SIZE behind, meaning it anchors exactly exactly `start_depth`.
         assert out_sym.offset_from_base == start_depth, "Macro evaluation hardware bounds definitively broke strict return symbol alignment initialization offset mapping parameters"
         
         old_lhs = getattr(self, 'current_assignment_lhs', None)
@@ -793,14 +798,13 @@ class Compiler:
 
         offset = out_sym.offset_from_base - self.current_stack_depth
         
-        # STRICT MEMORY ASSERT:
         assert offset <= -asm.REGISTER_SIZE, f"Macro call layout error: Output offset {offset} targets the unallocated SP tip (0). Values safely live strictly negative relative to SP."
-        
         assert offset <= 0, "Macro alignment layout parameters mandate absolute negative hardware boundaries returning locally scoped outputs mapped underneath execution limits"
         assert offset % asm.REGISTER_SIZE == 0, "Macro out parameter layout offset completely misaligned entirely breaking hardware memory limits"
         
         asm.lw(platform.t0, platform.stack_ptr, offset)
         self.exit_scope()
+        self.macro_expansion_stack.pop()
 
         diff = self.current_stack_depth - start_depth
         assert diff >= 0, "Macro map execution entirely shattered execution hardware bounds rendering negative stack memory frames impossible"
@@ -964,9 +968,19 @@ class Compiler:
         eval_args =[]
         
         for i, arg in enumerate(node.children[1:]):
-            if inst_name in {"jal", "bge", "beq", "bne", "label"} and i == len(node.children[1:]) - 1:
+            # Include an expanded branch set to capture labels effectively 
+            if inst_name in {"jal", "bge", "blt", "bgeu", "bltu", "beq", "bne", "label"} and i == len(node.children[1:]) - 1:
                 val = arg.value if hasattr(arg, 'value') else arg
                 assert isinstance(val, (str, int)), f"Branch jump targets physically mandate resolution maps against strings or offsets, breaching mapping logic with '{val}'"
+                
+                if isinstance(val, str):
+                    # Guarantee unique string mangling to avoid raw inline collisions or cross-function collision
+                    if getattr(self, 'macro_expansion_stack', None):
+                        val = f"{val}_mac{self.macro_expansion_stack[-1]}"
+                    elif getattr(self, 'current_function_name', None):
+                        func_mangled = self.current_function_name.replace('.', '_')
+                        val = f"{val}_fn_{func_mangled}"
+
                 eval_args.append({'type': 'literal', 'val': val})
                 continue
 
@@ -1032,7 +1046,7 @@ class Compiler:
                 
         # NEGATIVE SPACE PROGRAMMING: Prevent any structural string bleed into raw hardware functions
         for idx, a in enumerate(args):
-            if inst_name in {"jal", "bge", "beq", "bne", "label"} and idx == len(args) - 1:
+            if inst_name in {"jal", "bge", "blt", "bgeu", "bltu", "beq", "bne", "label"} and idx == len(args) - 1:
                 continue
             assert isinstance(a, int), f"Execution hardware map categorically rejects non-integer binding payload at arg {idx} for '{inst_name}', completely breaking physical constraints. Received '{a}'"
                 
@@ -1062,8 +1076,8 @@ class Compiler:
         else:
             # STRICT CONTROL FLOW ASSERT:
             assert rd_reg_to_push == 0, "Execution logically bounded structural limits explicitly restricting returning payload blocks bypassing safe branch mappings unconditionally"
-            assert inst_name in {"store", "sw", "sb", "bge", "beq", "bne", "ecall", "label"}, "Volatile bypass safety assertion caught invalid instruction escaping RD bounds requirement"
-        
+            assert inst_name in {"store", "sw", "sb", "bge", "blt", "bgeu", "bltu", "beq", "bne", "ecall", "label"}, "Volatile bypass safety assertion caught invalid instruction escaping RD bounds requirement"
+            
     def Tuple(self, node):
         assert node.node_type == NodeType.Tuple, "Execution parameter sequence requires physically standard map logic directly translating entirely targeting tuple sequences exactly"
         for child in node.children:
