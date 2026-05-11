@@ -1,10 +1,3 @@
-The main idea is to have a language that you have to define just about everything about how you use data.
-
-Language documentation sanity is coming soon:tm:
-
-:^)
-a simple hello world.w :
-
 
 write : _ = (ptr, len) : {
         @asm(addi, x17, zero, 2); // Syscall 2: write stdout
@@ -21,4 +14,3 @@ ptr = 1000;
 [ptr + 8] = 0x21646C72; // "rld!"
 
 write(ptr, 12);
-

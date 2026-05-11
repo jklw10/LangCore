@@ -69,13 +69,18 @@ sys : value[int] = (bytes[0:0]): {
         @asm(add, bytes_read, zero, x10); // Returns bytes read in a0
     };
 
-    .write : _ = (ptr[int], len[int]) : {
-        @asm(addi, x17, zero, 2); // Syscall 2: Write stdout
+    .read : [ptr] = (ptr[int], len[int]) : {
+        @asm(addi, x17, zero, 3); // Syscall 3: read stdout
         @asm(add, x11, zero, ptr);
         @asm(add, x12, zero, len);
         @asm(ecall);
     };
-
+    .write : _ = (ptr[int], len[int]) : {
+        @asm(addi, x17, zero, 2); // Syscall 2: write stdout
+        @asm(add, x11, zero, ptr);
+        @asm(add, x12, zero, len);
+        @asm(ecall);
+    };
     .print_int : _ = (val[int]) : {
         @asm(addi, x17, zero, 1); // Syscall 1: Print Int
         @asm(add, x10, zero, val);

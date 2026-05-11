@@ -5,7 +5,7 @@ import traceback
 import platform
 import compiler
 import disasm 
-
+import sys
 def load_cpu_lib():
     """Loads the RISC-V CPU C library."""
     lib_name = "cpu.dll" if os.name == 'nt' else "libcpu.so"
@@ -93,11 +93,15 @@ def run_program(lib, RiscVState, filepath):
     if cpu_state.regs[10] != 0:
         print(f"Final a0 (x10): {cpu_state.regs[10]}")
 
-def main():
+def main(args):
     lib, RiscVState = load_cpu_lib()
     if not lib:
         return
     
+    if args is not None:
+        run_program(lib, RiscVState, args)
+        return
+
     test_files = sorted(glob.glob("tests/*.w"))
     
     if not test_files:
@@ -108,4 +112,5 @@ def main():
         run_program(lib, RiscVState, test_file)
 
 if __name__ == "__main__":
-    main()
+      
+    main(sys.argv[1])

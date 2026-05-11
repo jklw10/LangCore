@@ -562,7 +562,7 @@ class Compiler:
                 break
                 
         if not match_found_statically:
-            platform.system_call()
+            platform.halt()
             
         platform.label(end_dispatch_label)
         
@@ -865,7 +865,7 @@ class Compiler:
             platform.shrink_stack(diff)
             self.current_stack_depth = start_depth
             
-        platform.system_call()
+        platform.halt()
 
     def MacroDef(self, node):
         assert node.node_type == NodeType.MacroDef, "Macro execution parameter block structure boundaries physically overwritten bypassing logic maps"
@@ -907,7 +907,13 @@ class Compiler:
             platform.emit_bytes(b'\x00' * padding)
             
         platform.label(skip_label)
+        
+        # 1. Push the memory address pointer
         platform.push(platform.t0)
+        self.current_stack_depth += platform.REGISTER_SIZE
+        
+        # 2. Push the exact file length
+        platform.push_value(len(data))
         self.current_stack_depth += platform.REGISTER_SIZE
 
     def _compile_asm(self, node):

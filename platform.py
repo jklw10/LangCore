@@ -125,6 +125,10 @@ def branch_not_equal(rs1, rs2, target_label):
 def system_call():
     asm.ecall()
 
+def halt():
+    emit_instruction("addi", 17, 0, 0)
+    asm.ecall()
+
 def store_deref(addr_reg, src_reg):
     asm.store(addr_reg, 0, src_reg)
 

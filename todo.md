@@ -14,26 +14,6 @@ during debugging:
 
 current task:
 
-ok the lang docs have gotten a little separated from each other at the moment the compiler itself is ground truth. along with the code defined in todo.md it currently compiles and runs with correct outputs atleast from the limited testing i did:
-
-test.w:
-[680 cycles] Memory[65000] received value: 15
-[1422 cycles] Memory[65000] received value: 10
-[1478 cycles] Memory[65000] received value: 12
-[1519 cycles] Memory[65000] received value: 99
-
-Execution finished in 1521 cycles.
-Final SP (x2): 0x00008000
-tokenizer.w:
-asdf
-
-Execution finished in 442 cycles.
-Final SP (x2): 0x00008030
-Final a0 (x10): 6
-
-this is the final python version of this and will be frozen. we're onto phase 2 unless an actual compiler issue props up.
-
-i don't care about function names but the decisions that have been made in it's design, i will prune it from context then and we'll move on to the rest one by one. i would like the docs to be generic enough to be useable when this is re-written in .w so no python specifics. ask if there's decisions.
 
 std.w:
 

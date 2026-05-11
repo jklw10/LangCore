@@ -50,3 +50,4 @@ While the language abstracts control flow via macros, it still needs direct comm
 
 *   `@asm`: Injects bare-metal hardware instructions (like `add`, `jalr`, `ecall`) directly into the AST, completely bypassing language semantics.
 *   `@import` / `@using`: Triggers file-system callbacks during the parsing phase, fetching external `.w` files, parsing them into ASTs, and updating the global `MacroRegistry` before continuing to parse the current file.
+*   `@embed`: Embeds file data directly in the binary.
