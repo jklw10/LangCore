@@ -1,4 +1,3 @@
-
 from asm import RiscVAssembler
 
 # Create the assembler
@@ -21,6 +20,7 @@ reg_map.update({
     "s2": 18, "s3": 19, "s4": 20, "s5": 21, "s6": 22, "s7": 23, "s8": 24, "s9": 25, "s10": 26, "s11": 27,
     "t3": 28, "t4": 29, "t5": 30, "t6": 31
 })
+
 imm_positions = {
     "lui": {1}, "jal": {1}, "jalr": {2},
     "beq": {2}, "bne": {2}, "bge": {2},
@@ -28,76 +28,148 @@ imm_positions = {
     "sw": {1}, "sb": {1},
     "addi": {2}, "xori": {2}, "ori": {2}, "andi": {2}, "sltiu": {2},
 }
-no_rd_instructions = {"store", "sw", "sb", "bge", "beq", "bne", "ecall", "label"}                
-#x_ret = 31 #register
 
-#stack ptr is at 2, skip it, i should check if this is universal
-stack_ptr = 2 #register, i like a little verbose
-stack_start = 0x8000 #memory
-stack_incr = asm.REGISTER_SIZE #bytes
-#LOCALS = 0 #memory
-#RETVAL = 1 #memory
-#ARGS = 2 #memory
+no_rd_instructions = {"store", "sw", "sb", "bge", "blt", "bgeu", "bltu", "beq", "bne", "ecall", "label"}                
+
+REGISTER_SIZE = asm.REGISTER_SIZE 
+
+stack_ptr = 2 
+stack_start = 0x8000 
+stack_incr = REGISTER_SIZE
 
 def init():
-    #"""4b"""
     load_immediate(stack_ptr, stack_start)
-    #asm.addi(stack_ptr, stack_ptr, stack_start) 
 
 def push(reg):
-    """push register to stack"""
     asm.sw(stack_ptr, 0, reg)                
     asm.addi(stack_ptr, stack_ptr, stack_incr)     
 
 def pop(reg):
-    """pop from stack to register"""
     asm.addi(stack_ptr, stack_ptr, -stack_incr)  
     asm.lw(reg, stack_ptr, 0)                  
 
 def peek(reg):
-    """peek stack to register"""
     asm.lw(reg, stack_ptr, -stack_incr)
 
 def load_immediate(reg, val):
-    """
-    Smart load: Uses ADDI for small numbers, LUI+ADDI for large ones.
-    """
     if -2048 <= val <= 2047:
         asm.addi(reg, x0, val)
         return
     lo = val & 0xFFF
     hi = val >> 12
-    
     if lo & 0x800:
         hi += 1
-        
     asm.lui(reg, hi)
     asm.addi(reg, reg, lo)
 
 def push_value(value):
-    """push value to stack (handles large integers)"""
     load_immediate(t0, value)
     push(t0)
 
 def push_static(addr):
-    """push memory at address to stack"""
     asm.lw(t0, addr, 0)
     push(t0)
 
 def pop_static(addr):
-    """pop value to address in memory"""
     pop(t0)
     asm.sw(addr,0,t0)
 
 def push_mem():
-    """push value at stack to memory"""
     pop(t0)
     push_static(t0)
 
 def pop_mem():
-    """pop 2 values, first is address, second is what goes there"""
     pop(t0)
     pop(t1)
     asm.sw(t0,0,t1)
 
-    
+# ---- Backend Abstraction Interface ----
+
+def get_safe_regs():
+    return [18, 19, 20, 21, 22, 23, 24, 25]
+
+def get_temp_regs_for_tco(count):
+    regs = [5, 6, 7, 28, 29, 30, 31, 10, 11, 12, 13, 14, 15, 16, 17]
+    return regs[:count]
+
+def get_temp_regs_for_asm():
+    return [6, 7, 28, 29, 30, 31]
+
+def read_local(dest_reg, offset):
+    asm.lw(dest_reg, stack_ptr, offset)
+
+def write_local(offset, src_reg):
+    asm.store(stack_ptr, offset, src_reg)
+
+def shrink_stack(bytes_count):
+    asm.addi(stack_ptr, stack_ptr, -bytes_count)
+
+def jump(label_name):
+    asm.jal(x0, label_name)
+
+def call(label_name):
+    asm.jal(ra, label_name)
+
+def jump_and_link(dest_reg, label_name):
+    asm.jal(dest_reg, label_name)
+
+def return_jump():
+    asm.jalr(x0, ra, 0)
+
+def label(name):
+    asm.label(name)
+
+def branch_not_equal(rs1, rs2, target_label):
+    asm.bne(rs1, rs2, target_label)
+
+def system_call():
+    asm.ecall()
+
+def store_deref(addr_reg, src_reg):
+    asm.store(addr_reg, 0, src_reg)
+
+def load_deref(dest_reg, addr_reg):
+    asm.lw(dest_reg, addr_reg, 0)
+
+def emit_bytes(data):
+    asm.code.extend(data)
+
+def emit_instruction(inst_name, *args):
+    asm_method = getattr(asm, inst_name)
+    if asm_method is None:
+        raise ValueError(f"Unknown instruction: {inst_name}")
+    asm_method(*args)
+
+def is_mutating_instruction(inst_name):
+    return inst_name in {"store", "sw", "sb"}
+
+def is_volatile_instruction(inst_name):
+    return inst_name in no_rd_instructions
+
+def is_branch_target(inst_name, arg_index, num_args):
+    branches = {"jal", "bge", "blt", "bgeu", "bltu", "beq", "bne", "label"}
+    return inst_name in branches and arg_index == num_args - 1
+
+def is_immediate_arg(inst_name, arg_index):
+    return inst_name in imm_positions and arg_index in imm_positions[inst_name]
+
+def is_register(name):
+    return name in reg_map
+
+def get_register(name):
+    return reg_map[name]
+
+def has_rd_register(inst_name):
+    return inst_name not in no_rd_instructions
+
+def reset_assembler():
+    asm.code = bytearray()
+    asm.labels = {}
+    asm.fixups = {}
+    asm.pc = 0
+
+def get_binary():
+    return asm.get_binary()
+
+def get_code_length():
+    return len(asm.code)

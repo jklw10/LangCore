@@ -58,9 +58,8 @@ sum[int] = 0;
 ptr = 65000;
 sum, [ptr] = loop(1, i, sum, ptr)
 
-
 // Function Definitions dynamically returning an [int] type 
-// i need to look into defining 2[int] or int(2) as input types instead of assuming type here:
+// i need to look into forcing 2[int] or int(2) as input types instead of assuming type here:
 
 foo : res[int] = (1, 2) : { res = 10 };
 foo : res[int] = (x, 2) : { res = x + 10 };

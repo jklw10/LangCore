@@ -1,11 +1,9 @@
 import platform
 import tokens
 import AST
-from platform import asm
 from AST import NodeType, ASTNode
 from typing import Dict, List, Optional
 from dataclasses import dataclass
-
 
 class Workspace:
     def __init__(self):
@@ -24,11 +22,11 @@ class Workspace:
         assert full_ast.node_type == NodeType.Program, "Compilation structural entry point must be a Program node"
         
         comp = Compiler()
-        result_asm = comp.compile(full_ast)
+        result_platform = comp.compile(full_ast)
         
-        assert result_asm is not None, "Compiler failed to yield a valid assembly block representation"
-        assert hasattr(result_asm, 'code') and len(result_asm.code) > 0, "Compilation critically output zero executable machine code instructions targeting bare minimum evaluation"
-        return result_asm
+        assert result_platform is not None, "Compiler failed to yield a valid assembly block representation"
+        assert hasattr(result_platform, 'get_code_length') and result_platform.get_code_length() > 0, "Compilation critically output zero executable machine code instructions targeting bare minimum evaluation"
+        return result_platform
 
     def discover_file(self, filepath):
         assert isinstance(filepath, str), "Filepath must be processed as a strict string type"
@@ -42,8 +40,6 @@ class Workspace:
         
         token_list = tokens.tokenize(source)
         
-        # Pass 1: Parse everything (no skipping) to extract Types AND Macros
-        # Passing self.discover_file as import_callback allows AST to synchronously resolve dependencies and their macros inline!
         parser = AST.Parser(token_list, self.macro_registry, skip_blocks=False, type_env=self.global_types, exported_macros=self.global_macros, import_callback=self.discover_file)
         ast_skeleton = parser.parse_program()
         
@@ -96,8 +92,6 @@ class Workspace:
             
         token_list = tokens.tokenize(source)
         
-        # During the semantic pass, the global_macros mapping is already fully baked from Pass 1,
-        # so we pass None to skip unnecessarily repeating the synchronous IO callback overhead.
         parser = AST.Parser(token_list, self.macro_registry, skip_blocks=False, type_env=self.global_types.copy(), exported_macros=self.global_macros, import_callback=None)
         ast_full = parser.parse_program()
         
@@ -154,10 +148,8 @@ class Compiler:
 
     def get_unique_label(self, prefix="lbl"):
         assert isinstance(prefix, str) and prefix, "Label prefix request must be a valid non-empty string"
-        
         self.label_counter += 1
         label = f"{prefix}_{self.label_counter}"
-        
         assert label.startswith(prefix), "Generated label critically failed to inherit the requested system prefix"
         return label
 
@@ -169,10 +161,9 @@ class Compiler:
         self._register_functions(node)
         self._compile_node(node)
         
-        assert asm is not None, "Assembler instance dropped or nullified during core compilation phase"
         assert len(self.scopes) == 1, f"Compiler execution leaked {len(self.scopes) - 1} un-exited scope layers upon finish"
         assert self.current_stack_depth == 0, f"Compilation fully leaked structural hardware memory frame bounds maintaining unresolved {self.current_stack_depth} byte total footprint sequence"
-        return asm
+        return platform
     
     def _register_functions(self, node: ASTNode, current_type_context=None):
         if not node: 
@@ -271,7 +262,7 @@ class Compiler:
             if name in scope:
                 sym = scope[name]
                 assert isinstance(sym, SymbolInfo), "Symbol mapping critically failed to yield a typed SymbolInfo object"
-                assert sym.offset_from_base % asm.REGISTER_SIZE == 0, f"Symbol '{name}' offset must be strictly register-aligned"
+                assert sym.offset_from_base % platform.REGISTER_SIZE == 0, f"Symbol '{name}' offset must be strictly register-aligned"
                 assert sym.offset_from_base <= self.current_stack_depth, f"Symbol '{name}' offset {sym.offset_from_base} logically violates current stack depth limit mapping {self.current_stack_depth}"
                 return sym
                 
@@ -281,17 +272,14 @@ class Compiler:
         assert isinstance(name, str) and name, "Symbol layout declaration requires an exact string name"
         assert len(self.scopes) > 0, "Local layer assignment invariant violated: No active scope exists"
         assert name not in self.scopes[-1], f"Local variable '{name}' overlaps an already defined footprint in the active scope layer"
-        assert self.current_stack_depth >= asm.REGISTER_SIZE, "Hardware layout calculation prohibits declaring symbols with no stack space allocated"
+        assert self.current_stack_depth >= platform.REGISTER_SIZE, "Hardware layout calculation prohibits declaring symbols with no stack space allocated"
         
-        # FIX: The symbol resides at the depth it was just pushed to, not the unallocated tip ahead of it.
-        info = SymbolInfo(offset_from_base=self.current_stack_depth - asm.REGISTER_SIZE)
+        info = SymbolInfo(offset_from_base=self.current_stack_depth - platform.REGISTER_SIZE)
         
-        assert info.offset_from_base <= self.current_stack_depth - asm.REGISTER_SIZE, f"Symbol declaration error: Recorded absolute offset {info.offset_from_base} identically points to the current empty SP tip, not the physically populated slot beneath it."
-        
-        assert info.offset_from_base % asm.REGISTER_SIZE == 0, f"Hardware violation: Local variable offset {info.offset_from_base} misaligned to the {asm.REGISTER_SIZE} byte boundaries"
+        assert info.offset_from_base <= self.current_stack_depth - platform.REGISTER_SIZE, f"Symbol declaration error: Recorded absolute offset {info.offset_from_base} identically points to the current empty SP tip, not the physically populated slot beneath it."
+        assert info.offset_from_base % platform.REGISTER_SIZE == 0, f"Hardware violation: Local variable offset {info.offset_from_base} misaligned to the {platform.REGISTER_SIZE} byte boundaries"
         
         self.scopes[-1][name] = info
-        
         assert self.scopes[-1][name] is info, "Symbol mapping strictly failed to bind new layout info to active scope map structure"
         return info
 
@@ -302,31 +290,30 @@ class Compiler:
         
         if hasattr(self, 'static_fields') and node.value in self.static_fields:
             platform.push_value(self.static_fields[node.value])
-            self.current_stack_depth += asm.REGISTER_SIZE
+            self.current_stack_depth += platform.REGISTER_SIZE
             return
 
         sym = self.get_symbol(node.value)
         if not sym: 
             if node.type_name:
                 platform.push(platform.x0)
-                self.current_stack_depth += asm.REGISTER_SIZE
+                self.current_stack_depth += platform.REGISTER_SIZE
                 sym = self.declare_symbol(node.value)
                 return
             raise ValueError(f"Undefined variable footprint lookup: '{node.value}' at line {node.line}:{node.col}")
             
         offset = sym.offset_from_base - self.current_stack_depth
         
-        assert offset <= -asm.REGISTER_SIZE, f"Memory read error: Calculated offset {offset} for '{node.value}' reads the unallocated stack tip (0(sp)). Must read physically populated negative frame space."
-        
+        assert offset <= -platform.REGISTER_SIZE, f"Memory read error: Calculated offset {offset} for '{node.value}' reads the unallocated stack tip (0(sp)). Must read physically populated negative frame space."
         assert offset <= 0, f"CRITICAL BUG: Memory offset {offset} for '{node.value}' is positive. Stack physics mandate reading old variables at negative offsets below the upward-growing SP!"
-        assert abs(offset) < (15 * asm.REGISTER_SIZE), f"Memory offset {offset} for '{node.value}' exceeds all logical bounds of the caller frame map footprint."
-        assert offset % asm.REGISTER_SIZE == 0, f"Hardware offset memory fetch definitively broke structural alignment bounds: {offset}"
+        assert abs(offset) < (15 * platform.REGISTER_SIZE), f"Memory offset {offset} for '{node.value}' exceeds all logical bounds of the caller frame map footprint."
+        assert offset % platform.REGISTER_SIZE == 0, f"Hardware offset memory fetch definitively broke structural alignment bounds: {offset}"
         
-        asm.lw(platform.t0, platform.stack_ptr, offset) 
+        platform.read_local(platform.t0, offset) 
         platform.push(platform.t0)
-        self.current_stack_depth += asm.REGISTER_SIZE
+        self.current_stack_depth += platform.REGISTER_SIZE
         
-        assert self.current_stack_depth >= asm.REGISTER_SIZE, "Stack depth evaluation physically unbalanced tracking after valid Identifier pull"
+        assert self.current_stack_depth >= platform.REGISTER_SIZE, "Stack depth evaluation physically unbalanced tracking after valid Identifier pull"
 
     def FunctionDef(self, node):
     
@@ -335,7 +322,6 @@ class Compiler:
         assert len(node.children) > 0, "Execution block definition contains no structurally executable nodes"
         
         func_name = node.value
-        
         if func_name.startswith(".") and getattr(self, 'current_type_context', None):
             func_name = self.current_type_context + func_name
 
@@ -358,9 +344,9 @@ class Compiler:
         func_label = self._mangle_label(func_name, pat_args)
         
         skip_label = self.get_unique_label("skip_func")
-        asm.jal(platform.x0, skip_label)
+        platform.jump(skip_label)
         
-        asm.label(func_label)
+        platform.label(func_label)
         
         old_func_name = getattr(self, 'current_function_name', None)
         self.current_function_name = func_name
@@ -373,37 +359,34 @@ class Compiler:
         self.current_stack_depth = 0
         
         platform.push(platform.ra)
-        self.current_stack_depth += asm.REGISTER_SIZE
+        self.current_stack_depth += platform.REGISTER_SIZE
         
-        assert self.current_stack_depth == asm.REGISTER_SIZE, "Stack physics mapping crucially requires exact RA baseline registration initialization depth"
+        assert self.current_stack_depth == platform.REGISTER_SIZE, "Stack physics mapping crucially requires exact RA baseline registration initialization depth"
         
         offset = 0
         for p in reversed(pat_args):
-            # FIX: Decrement offset *before* evaluation to prevent `0` matching.
-            offset -= asm.REGISTER_SIZE
+            offset -= platform.REGISTER_SIZE
             assert p.node_type in (NodeType.Identifier, NodeType.Value, NodeType.Tuple), f"Evaluation expects standard AST signature pattern parameter, got {p.node_type}"
             if p.node_type == NodeType.Identifier:
-                # STRICT MEMORY ASSERT:
-                assert offset <= -asm.REGISTER_SIZE, f"Hardware layout error: Parameter '{p.value}' mapping offset is {offset}, explicitly overlapping caller's unallocated SP tip. Must be strictly negative."
-                
+                assert offset <= -platform.REGISTER_SIZE, f"Hardware layout error: Parameter '{p.value}' mapping offset is {offset}, explicitly overlapping caller's unallocated SP tip. Must be strictly negative."
                 info = SymbolInfo(offset_from_base=offset)
                 assert info.offset_from_base <= 0, f"Hardware layout error: Parameter '{p.value}' must occupy a non-positive base offset reflecting the caller's stack frame"
-                assert info.offset_from_base % asm.REGISTER_SIZE == 0, "Caller parameter transmission offset must fall exactly on strict register boundaries"
+                assert info.offset_from_base % platform.REGISTER_SIZE == 0, "Caller parameter transmission offset must fall exactly on strict register boundaries"
                 self.scopes[-1][p.value] = info
             
-        assert offset == -len(pat_args) * asm.REGISTER_SIZE, "Frame mapping mathematics critically bypassed evaluating standard parameter footprint structures"
+        assert offset == -len(pat_args) * platform.REGISTER_SIZE, "Frame mapping mathematics critically bypassed evaluating standard parameter footprint structures"
         
         platform.push(platform.x0)
-        self.current_stack_depth += asm.REGISTER_SIZE
+        self.current_stack_depth += platform.REGISTER_SIZE
         
         for rv in ret_nodes:
             if rv.node_type == NodeType.Identifier:
                 if rv.value not in self.scopes[-1]:
                     platform.push(platform.x0)
-                    self.current_stack_depth += asm.REGISTER_SIZE
+                    self.current_stack_depth += platform.REGISTER_SIZE
                     self.declare_symbol(rv.value)
 
-        asm.label(func_label + "_loop")
+        platform.label(func_label + "_loop")
             
         old_type_ctx = getattr(self, 'current_type_context', None)
         self.current_type_context = func_name
@@ -415,7 +398,7 @@ class Compiler:
         self.current_assignment_lhs = None
         
         expected_body_depth = self.current_stack_depth
-        assert expected_body_depth >= 2 * asm.REGISTER_SIZE, "Callee scope bounds fatally failed establishing bare minimum layout (RA + 0-init) requirements"
+        assert expected_body_depth >= 2 * platform.REGISTER_SIZE, "Callee scope bounds fatally failed establishing bare minimum layout (RA + 0-init) requirements"
         
         self._compile_node(body)
         
@@ -426,7 +409,7 @@ class Compiler:
         self.current_type_context = old_type_ctx
         self.current_return_node = old_ret_node
         
-        safe_regs =[18, 19, 20, 21, 22, 23, 24, 25] 
+        safe_regs = platform.get_safe_regs()
         assert len(ret_nodes) <= len(safe_regs), "Method signature declares return parameters explicitly exceeding the safe internal RISC transport bridge"
         
         if ret_nodes:
@@ -434,29 +417,29 @@ class Compiler:
                 self._compile_node(rv)
             for i in reversed(range(len(ret_nodes))):
                 platform.pop(safe_regs[i])
-                self.current_stack_depth -= asm.REGISTER_SIZE
+                self.current_stack_depth -= platform.REGISTER_SIZE
         else:
             platform.load_immediate(safe_regs[0], 0)
         
-        diff = self.current_stack_depth - asm.REGISTER_SIZE
+        diff = self.current_stack_depth - platform.REGISTER_SIZE
         assert diff >= 0, f"Calley frame shrink constraint crashed: Depth {self.current_stack_depth} physically undercut the fundamental return address mark!"
         
         if diff > 0:
-            asm.addi(platform.stack_ptr, platform.stack_ptr, -diff)
-            self.current_stack_depth = asm.REGISTER_SIZE
+            platform.shrink_stack(diff)
+            self.current_stack_depth = platform.REGISTER_SIZE
             
         platform.pop(platform.ra)
-        self.current_stack_depth -= asm.REGISTER_SIZE
+        self.current_stack_depth -= platform.REGISTER_SIZE
         
         assert self.current_stack_depth == 0, "Execution callee bounds assert failed: Depth must hit strict flat zero mark prior to pipeline jalr branch logic"
         
-        asm.jalr(platform.x0, platform.ra, 0)
+        platform.return_jump()
         
         self.current_stack_depth = old_stack_depth
         self.exit_scope()
         self.current_function_name = old_func_name
         
-        asm.label(skip_label)
+        platform.label(skip_label)
         assert self.current_stack_depth == old_stack_depth, "Parent scope map fatally injured compiling dynamic child layout definition footprint"
     
     
@@ -485,11 +468,11 @@ class Compiler:
         for arg in call_args:
             depth_before_arg = self.current_stack_depth
             self._compile_node(arg)
-            assert self.current_stack_depth == depth_before_arg + asm.REGISTER_SIZE, f"Expression '{getattr(arg, 'value', arg.node_type)}' yielded abnormal bit size layout skewing runtime memory map alignment"
+            assert self.current_stack_depth == depth_before_arg + platform.REGISTER_SIZE, f"Expression '{getattr(arg, 'value', arg.node_type)}' yielded abnormal bit size layout skewing runtime memory map alignment"
             
         self.current_assignment_lhs = old_lhs
         
-        expected_arg_bytes = len(call_args) * asm.REGISTER_SIZE
+        expected_arg_bytes = len(call_args) * platform.REGISTER_SIZE
         assert self.current_stack_depth == initial_depth + expected_arg_bytes, f"Arg frame computation mismatch: pushed {self.current_stack_depth - initial_depth} bytes, mathematically expected {expected_arg_bytes}"
             
         end_dispatch_label = self.get_unique_label("end_disp")
@@ -526,100 +509,90 @@ class Compiler:
                             continue
                             
                     has_runtime_checks = True
+                    offset_from_top = (len(call_args) - i) * platform.REGISTER_SIZE
                     
-                    # FIX: Mathematical boundary fixed here. Index offset logically maps -i directly to negative bounds preventing 0 edge case overlap. 
-                    offset_from_top = (len(call_args) - i) * asm.REGISTER_SIZE
-                    
-                    # STRICT MEMORY ASSERT:
-                    assert offset_from_top >= asm.REGISTER_SIZE, f"Dispatch layout error: Offset {-offset_from_top} targets the unallocated SP tip (0). Pushed arguments mathematically reside in negative space."
-                    
+                    assert offset_from_top >= platform.REGISTER_SIZE, f"Dispatch layout error: Offset {-offset_from_top} targets the unallocated SP tip (0). Pushed arguments mathematically reside in negative space."
                     assert offset_from_top > 0 and offset_from_top <= expected_arg_bytes, f"Dispatch read check maps completely disjoint index bounds {offset_from_top}"
-                    assert offset_from_top % asm.REGISTER_SIZE == 0, "Dynamic dispatch index verification misaligned strict structural constraints"
+                    assert offset_from_top % platform.REGISTER_SIZE == 0, "Dynamic dispatch index verification misaligned strict structural constraints"
                     
-                    asm.lw(platform.t0, platform.stack_ptr, -offset_from_top)
+                    platform.read_local(platform.t0, -offset_from_top)
                     platform.load_immediate(platform.t1, p.value)
-                    asm.bne(platform.t0, platform.t1, next_def_label)
+                    platform.branch_not_equal(platform.t0, platform.t1, next_def_label)
                     
             if static_fail:
                 continue
                 
             if is_tro:
                 saved_depth = self.current_stack_depth
-                
-                temp_regs =[5, 6, 7, 28, 29, 30, 31, 10, 11, 12, 13, 14, 15, 16, 17][:len(pat_args)]
+                temp_regs = platform.get_temp_regs_for_tco(len(pat_args))
                 assert len(temp_regs) == len(pat_args), "Insufficient strict hardware execution registers to hold active TCO unwinding payloads"
                 
                 for reg in reversed(temp_regs):
                     platform.pop(reg)
-                    self.current_stack_depth -= asm.REGISTER_SIZE
+                    self.current_stack_depth -= platform.REGISTER_SIZE
                 
                 assert self.current_stack_depth == saved_depth - expected_arg_bytes, "Stack unwind alignment mathematically missed layout requirement bounds post-TCO argument pop"
                 
                 for i, reg in enumerate(reversed(temp_regs)):
-                    # FIX: Writeback index parameter logically shifts to strictly bypass 0(sp)
-                    target_offset_from_base = -asm.REGISTER_SIZE * (i + 1)
-                    
-                    # STRICT MEMORY ASSERT:
-                    assert target_offset_from_base <= -asm.REGISTER_SIZE, f"TCO layout error: Overwrite target offset for arg {i} is {target_offset_from_base}, fatally corrupting the unallocated caller SP tip."
+                    target_offset_from_base = -platform.REGISTER_SIZE * (i + 1)
+                    assert target_offset_from_base <= -platform.REGISTER_SIZE, f"TCO layout error: Overwrite target offset for arg {i} is {target_offset_from_base}, fatally corrupting the unallocated caller SP tip."
 
                     offset = target_offset_from_base - self.current_stack_depth
+                    assert offset <= -platform.REGISTER_SIZE, f"CRITICAL TCO LEAK: Overwrite boundary offset {offset} must explicitly calculate downward entirely reaching caller parameter maps"
+                    assert offset % platform.REGISTER_SIZE == 0, "TCO parameter overwrite misaligned structurally bypassing valid map configurations"
                     
-                    # The offset must be negative and at least deep enough to bypass the RA / loop_base_depth mapping of the current frame bounds.
-                    assert offset <= -asm.REGISTER_SIZE, f"CRITICAL TCO LEAK: Overwrite boundary offset {offset} must explicitly calculate downward entirely reaching caller parameter maps"
-                    assert offset % asm.REGISTER_SIZE == 0, "TCO parameter overwrite misaligned structurally bypassing valid map configurations"
+                    platform.write_local(offset, reg)
                     
-                    asm.store(platform.stack_ptr, offset, reg)
-                    
-                diff = self.current_stack_depth - getattr(self, 'loop_base_depth', asm.REGISTER_SIZE)
+                diff = self.current_stack_depth - getattr(self, 'loop_base_depth', platform.REGISTER_SIZE)
                 assert diff >= 0, "TCO parameter evaluation base overlap failed runtime logic geometry constraint"
                 
                 if diff > 0:
-                    asm.addi(platform.stack_ptr, platform.stack_ptr, -diff) 
+                    platform.shrink_stack(diff)
                     
-                asm.jal(platform.x0, definition['label'] + "_loop")
+                platform.jump(definition['label'] + "_loop")
                 self.current_stack_depth = saved_depth
             else:
-                asm.jal(platform.ra, definition['label'])
-                asm.jal(platform.x0, end_dispatch_label)
+                platform.call(definition['label'])
+                platform.jump(end_dispatch_label)
                 
-            asm.label(next_def_label)
+            platform.label(next_def_label)
             
             if not has_runtime_checks:
                 match_found_statically = True
                 break
                 
         if not match_found_statically:
-            asm.ecall() 
+            platform.system_call()
             
-        asm.label(end_dispatch_label)
+        platform.label(end_dispatch_label)
         
         num_returns = len(defs[0]['ret_nodes']) if defs else 1
-        safe_regs =[18, 19, 20, 21, 22, 23, 24, 25]
+        safe_regs = platform.get_safe_regs()
 
         if is_tro:
             self.current_stack_depth -= expected_arg_bytes
             for _ in range(num_returns if num_returns > 0 else 1):
                 platform.push(platform.x0) 
-                self.current_stack_depth += asm.REGISTER_SIZE
+                self.current_stack_depth += platform.REGISTER_SIZE
                 
-            assert self.current_stack_depth == initial_depth + ((num_returns if num_returns > 0 else 1) * asm.REGISTER_SIZE), "TCO state logic exited map strictly missing correct payload delivery structure dimensions"
+            assert self.current_stack_depth == initial_depth + ((num_returns if num_returns > 0 else 1) * platform.REGISTER_SIZE), "TCO state logic exited map strictly missing correct payload delivery structure dimensions"
         else:
             num_args = len(call_args)
             if num_args > 0:
-                asm.addi(platform.stack_ptr, platform.stack_ptr, -(num_args * asm.REGISTER_SIZE))
-                self.current_stack_depth -= (num_args * asm.REGISTER_SIZE)
+                platform.shrink_stack(num_args * platform.REGISTER_SIZE)
+                self.current_stack_depth -= (num_args * platform.REGISTER_SIZE)
             
             assert self.current_stack_depth == initial_depth, "Call framework strictly mandates stack pointer reversion fully prior to output integration execution"
             
             if num_returns > 0:
                 for i in range(num_returns):
                     platform.push(safe_regs[i])
-                    self.current_stack_depth += asm.REGISTER_SIZE
+                    self.current_stack_depth += platform.REGISTER_SIZE
             else:
                 platform.push(safe_regs[0])
-                self.current_stack_depth += asm.REGISTER_SIZE
+                self.current_stack_depth += platform.REGISTER_SIZE
                 
-        assert self.current_stack_depth == initial_depth + (max(num_returns, 1) * asm.REGISTER_SIZE), "Execution framework entirely missed safe register pushing logic requirements post-call evaluation block"
+        assert self.current_stack_depth == initial_depth + (max(num_returns, 1) * platform.REGISTER_SIZE), "Execution framework entirely missed safe register pushing logic requirements post-call evaluation block"
 
     
     def Assignment(self, node):
@@ -661,22 +634,20 @@ class Compiler:
                 
             self._compile_node(node.right)
             
-            assert self.current_stack_depth == initial_depth + asm.REGISTER_SIZE, "RHS evaluation logic fundamentally maps standard assignments solely issuing 1 data segment exactly per operation"
+            assert self.current_stack_depth == initial_depth + platform.REGISTER_SIZE, "RHS evaluation logic fundamentally maps standard assignments solely issuing 1 data segment exactly per operation"
             
             sym = self.get_symbol(name)
             if sym:
                 platform.pop(platform.t0)
-                self.current_stack_depth -= asm.REGISTER_SIZE
+                self.current_stack_depth -= platform.REGISTER_SIZE
                 
                 offset = sym.offset_from_base - self.current_stack_depth
                 
-                # STRICT MEMORY ASSERT:
-                assert offset <= -asm.REGISTER_SIZE, f"Assignment layout error: Offset {offset} for '{name}' targets unallocated SP tip (0). Overwrite must physically target negative populated space."
-                
+                assert offset <= -platform.REGISTER_SIZE, f"Assignment layout error: Offset {offset} for '{name}' targets unallocated SP tip (0). Overwrite must physically target negative populated space."
                 assert offset <= 0, f"CRITICAL: Assignment logic mapped overwrite target mathematically shifting into upper memory unallocated '{name}' footprint boundaries!"
-                assert offset % asm.REGISTER_SIZE == 0, "Assignment target physically misaligned entirely mapping local memory stores"
+                assert offset % platform.REGISTER_SIZE == 0, "Assignment target physically misaligned entirely mapping local memory stores"
                 
-                asm.store(platform.stack_ptr, offset, platform.t0)
+                platform.write_local(offset, platform.t0)
             else:
                 self.declare_symbol(name)
 
@@ -684,32 +655,32 @@ class Compiler:
             self.current_assignment_lhs = None
             self._compile_node(node.left.left)
             
-            assert self.current_stack_depth == initial_depth + asm.REGISTER_SIZE, "Target memory layout array access definitively failed producing valid strictly singular base address"
+            assert self.current_stack_depth == initial_depth + platform.REGISTER_SIZE, "Target memory layout array access definitively failed producing valid strictly singular base address"
             
             self.current_assignment_lhs = node.left
             self._compile_node(node.right)
             
-            assert self.current_stack_depth == initial_depth + 2 * asm.REGISTER_SIZE, "Deref memory calculation misaligned stack requirement executing base load and RHS payload bounds"
+            assert self.current_stack_depth == initial_depth + 2 * platform.REGISTER_SIZE, "Deref memory calculation misaligned stack requirement executing base load and RHS payload bounds"
             
             platform.pop(platform.t0)
-            self.current_stack_depth -= asm.REGISTER_SIZE
+            self.current_stack_depth -= platform.REGISTER_SIZE
             platform.pop(platform.t1)
-            self.current_stack_depth -= asm.REGISTER_SIZE
+            self.current_stack_depth -= platform.REGISTER_SIZE
             
-            asm.store(platform.t1, 0, platform.t0)
+            platform.store_deref(platform.t1, platform.t0)
             
         elif node.left.node_type == NodeType.Tuple:
             self._compile_node(node.right)
             
             num_targets = len(node.left.children)
-            assert self.current_stack_depth - initial_depth == num_targets * asm.REGISTER_SIZE, f"Tuple split mechanism completely overshot stack frame bounds delivering {(self.current_stack_depth - initial_depth) // asm.REGISTER_SIZE} components instead of mandatory {num_targets}"
+            assert self.current_stack_depth - initial_depth == num_targets * platform.REGISTER_SIZE, f"Tuple split mechanism completely overshot stack frame bounds delivering {(self.current_stack_depth - initial_depth) // platform.REGISTER_SIZE} components instead of mandatory {num_targets}"
             
-            safe_regs =[18, 19, 20, 21, 22, 23, 24, 25] 
+            safe_regs = platform.get_safe_regs()
             assert num_targets <= len(safe_regs), "Total layout constraint completely outnumbers strictly assigned sequence transit pathways"
             
             for i in reversed(range(num_targets)):
                 platform.pop(safe_regs[i])
-                self.current_stack_depth -= asm.REGISTER_SIZE
+                self.current_stack_depth -= platform.REGISTER_SIZE
                 
             for i, target in enumerate(node.left.children):
                 if target.node_type == NodeType.Identifier:
@@ -721,37 +692,36 @@ class Compiler:
                     if sym:
                         offset = sym.offset_from_base - self.current_stack_depth
                         
-                        assert offset <= -asm.REGISTER_SIZE, f"Tuple split layout error: Writeback offset {offset} for '{target_name}' targets unallocated SP tip instead of its logically allocated frame slot."
-                        
+                        assert offset <= -platform.REGISTER_SIZE, f"Tuple split layout error: Writeback offset {offset} for '{target_name}' targets unallocated SP tip instead of its logically allocated frame slot."
                         assert offset <= 0, f"Local array split assignment bounds structurally point backwards towards positive unallocated offset depth {offset}"
-                        assert offset % asm.REGISTER_SIZE == 0, "Tuple assignment extraction misaligned strictly executing local memory boundaries"
+                        assert offset % platform.REGISTER_SIZE == 0, "Tuple assignment extraction misaligned strictly executing local memory boundaries"
                         
-                        asm.store(platform.stack_ptr, offset, safe_regs[i])
+                        platform.write_local(offset, safe_regs[i])
                     else:
                         platform.push(safe_regs[i])
-                        self.current_stack_depth += asm.REGISTER_SIZE
+                        self.current_stack_depth += platform.REGISTER_SIZE
                         self.declare_symbol(target_name)
                         
                 elif target.node_type == NodeType.Deref:
                     for r in range(num_targets):
                         platform.push(safe_regs[r])
-                        self.current_stack_depth += asm.REGISTER_SIZE
+                        self.current_stack_depth += platform.REGISTER_SIZE
                     
                     depth_before_ptr = self.current_stack_depth
                     self.current_assignment_lhs = None
                     self._compile_node(target.left)
                     
-                    assert self.current_stack_depth == depth_before_ptr + asm.REGISTER_SIZE, "Evaluation of unpack pointer explicitly corrupted executing scope tracking parameters"
+                    assert self.current_stack_depth == depth_before_ptr + platform.REGISTER_SIZE, "Evaluation of unpack pointer explicitly corrupted executing scope tracking parameters"
                     self.current_assignment_lhs = node.left
                     
                     platform.pop(platform.t1)
-                    self.current_stack_depth -= asm.REGISTER_SIZE
+                    self.current_stack_depth -= platform.REGISTER_SIZE
                     
                     for r in reversed(range(num_targets)):
                         platform.pop(safe_regs[r])
-                        self.current_stack_depth -= asm.REGISTER_SIZE
+                        self.current_stack_depth -= platform.REGISTER_SIZE
                     
-                    asm.store(platform.t1, 0, safe_regs[i])
+                    platform.store_deref(platform.t1, safe_regs[i])
         else:
             raise SyntaxError(f"Syntax logic check failed unconditionally at line {node.line}:{node.col} -> Mapping execution target mapped unsupported assignment AST bounds {node.left.node_type.name}")
             
@@ -765,7 +735,6 @@ class Compiler:
         self.enter_scope()
         start_depth = self.current_stack_depth
         
-        # Track macro invocation for local inline label generation
         self.macro_expansion_counter += 1
         self.macro_expansion_stack.append(self.macro_expansion_counter)
         
@@ -779,7 +748,7 @@ class Compiler:
             raise SyntaxError(f"VMG Integrity Map Failure at {node.line}:{node.col}")
 
         platform.push(platform.x0)
-        self.current_stack_depth += asm.REGISTER_SIZE
+        self.current_stack_depth += platform.REGISTER_SIZE
         out_sym = self.declare_symbol(node.value)
         
         assert out_sym.offset_from_base == start_depth, "Macro evaluation hardware bounds definitively broke strict return symbol alignment initialization offset mapping parameters"
@@ -789,7 +758,7 @@ class Compiler:
         
         self._compile_node(node.left)
         
-        assert self.current_stack_depth >= start_depth + asm.REGISTER_SIZE, "Inline macro tree instruction completely discarded executing local parameter initialization scope boundary"
+        assert self.current_stack_depth >= start_depth + platform.REGISTER_SIZE, "Inline macro tree instruction completely discarded executing local parameter initialization scope boundary"
         
         self.current_assignment_lhs = old_lhs
         
@@ -798,11 +767,11 @@ class Compiler:
 
         offset = out_sym.offset_from_base - self.current_stack_depth
         
-        assert offset <= -asm.REGISTER_SIZE, f"Macro call layout error: Output offset {offset} targets the unallocated SP tip (0). Values safely live strictly negative relative to SP."
+        assert offset <= -platform.REGISTER_SIZE, f"Macro call layout error: Output offset {offset} targets the unallocated SP tip (0). Values safely live strictly negative relative to SP."
         assert offset <= 0, "Macro alignment layout parameters mandate absolute negative hardware boundaries returning locally scoped outputs mapped underneath execution limits"
-        assert offset % asm.REGISTER_SIZE == 0, "Macro out parameter layout offset completely misaligned entirely breaking hardware memory limits"
+        assert offset % platform.REGISTER_SIZE == 0, "Macro out parameter layout offset completely misaligned entirely breaking hardware memory limits"
         
-        asm.lw(platform.t0, platform.stack_ptr, offset)
+        platform.read_local(platform.t0, offset)
         self.exit_scope()
         self.macro_expansion_stack.pop()
 
@@ -810,13 +779,13 @@ class Compiler:
         assert diff >= 0, "Macro map execution entirely shattered execution hardware bounds rendering negative stack memory frames impossible"
         
         if diff > 0:
-            asm.addi(platform.stack_ptr, platform.stack_ptr, -diff)
+            platform.shrink_stack(diff)
             self.current_stack_depth = start_depth
 
         platform.push(platform.t0)
-        self.current_stack_depth += asm.REGISTER_SIZE
+        self.current_stack_depth += platform.REGISTER_SIZE
         
-        assert self.current_stack_depth == start_depth + asm.REGISTER_SIZE, "Macro block mapping logic critically bypassed safe execution returning completely misaligned physical bounds"
+        assert self.current_stack_depth == start_depth + platform.REGISTER_SIZE, "Macro block mapping logic critically bypassed safe execution returning completely misaligned physical bounds"
 
     def Block(self, node):
         assert node.node_type == NodeType.Block, "Block instruction routing mismatched strictly required internal AST identification parameters"
@@ -840,7 +809,7 @@ class Compiler:
         assert diff >= 0, f"Block scope mapping physically damaged local runtime hardware bounds returning negative differential sequence map bytes {diff}"
         
         if diff > 0:
-            asm.addi(platform.stack_ptr, platform.stack_ptr, -diff) 
+            platform.shrink_stack(diff)
             self.current_stack_depth = start_depth
             
         self.exit_scope()
@@ -893,10 +862,10 @@ class Compiler:
         diff = self.current_stack_depth - start_depth
         assert diff >= 0, "Top level program layout corrupted stack boundaries falling below absolute zero baseline"
         if diff > 0:
-            asm.addi(platform.stack_ptr, platform.stack_ptr, -diff)
+            platform.shrink_stack(diff)
             self.current_stack_depth = start_depth
             
-        asm.ecall()
+        platform.system_call()
 
     def MacroDef(self, node):
         assert node.node_type == NodeType.MacroDef, "Macro execution parameter block structure boundaries physically overwritten bypassing logic maps"
@@ -930,16 +899,16 @@ class Compiler:
         assert data is not None, "Hardware binary boundary bounds mapped directly loading blank execution sequences unconditionally missing parameter bounds logic configurations entirely mapping null bytes sequences"
         
         skip_label = self.get_unique_label("skip_embed")
-        asm.jal(platform.t0, skip_label)
-        asm.code.extend(data)
+        platform.jump_and_link(platform.t0, skip_label)
+        platform.emit_bytes(data)
         
-        padding = (asm.REGISTER_SIZE - (len(data) % asm.REGISTER_SIZE)) % asm.REGISTER_SIZE
+        padding = (platform.REGISTER_SIZE - (len(data) % platform.REGISTER_SIZE)) % platform.REGISTER_SIZE
         if padding > 0:
-            asm.code.extend(b'\x00' * padding)
+            platform.emit_bytes(b'\x00' * padding)
             
-        asm.label(skip_label)
+        platform.label(skip_label)
         platform.push(platform.t0)
-        self.current_stack_depth += asm.REGISTER_SIZE
+        self.current_stack_depth += platform.REGISTER_SIZE
 
     def _compile_asm(self, node):
         assert node.node_type == NodeType.Intrinsic and node.value == "asm", "Internal target system requirements strictly dictate exact ASM logic map routing constraints executing instructions unconditionally"
@@ -950,16 +919,13 @@ class Compiler:
         assert isinstance(inst_name, str), "Logic parameter mappings bounds mandate physical sequence identification purely executing directly mapping target strings entirely executing valid structural layout parameters mapping execution limits purely"
 
         if self.pure_context_out_var is not None:
-            if inst_name in {"store", "sw", "sb"}:
+            if platform.is_mutating_instruction(inst_name):
                 raise SyntaxError(f"Visible Mutation Guarantee Violation at {node.line}:{node.col} -> Pure macro limits execution boundaries strictly forbidding global sequence alterations fully mapping pure execution paths exactly mapping instructions altering map states")
 
         args = list()
-        reg_map = platform.reg_map
-        no_rd_instructions = platform.no_rd_instructions
-        imm_positions = platform.imm_positions
-        has_rd = inst_name not in no_rd_instructions
+        has_rd = platform.has_rd_register(inst_name)
         
-        temp_pool =[ 6, 7, 28, 29, 30, 31 ] 
+        temp_pool = platform.get_temp_regs_for_asm() 
         temp_idx = 0
         store_back_sym = None
         rd_reg_to_push = 0
@@ -968,13 +934,11 @@ class Compiler:
         eval_args =[]
         
         for i, arg in enumerate(node.children[1:]):
-            # Include an expanded branch set to capture labels effectively 
-            if inst_name in {"jal", "bge", "blt", "bgeu", "bltu", "beq", "bne", "label"} and i == len(node.children[1:]) - 1:
+            if platform.is_branch_target(inst_name, i, len(node.children[1:])):
                 val = arg.value if hasattr(arg, 'value') else arg
                 assert isinstance(val, (str, int)), f"Branch jump targets physically mandate resolution maps against strings or offsets, breaching mapping logic with '{val}'"
                 
                 if isinstance(val, str):
-                    # Guarantee unique string mangling to avoid raw inline collisions or cross-function collision
                     if getattr(self, 'macro_expansion_stack', None):
                         val = f"{val}_mac{self.macro_expansion_stack[-1]}"
                     elif getattr(self, 'current_function_name', None):
@@ -984,7 +948,7 @@ class Compiler:
                 eval_args.append({'type': 'literal', 'val': val})
                 continue
 
-            if inst_name in imm_positions and i in imm_positions[inst_name]:
+            if platform.is_immediate_arg(inst_name, i):
                 if getattr(arg, 'node_type', None) == NodeType.Value:
                     val = arg.value
                 else:
@@ -1002,10 +966,10 @@ class Compiler:
             name = getattr(arg_eval, 'value', None)
             is_output = (i == 0 and has_rd)
             
-            if isinstance(name, str) and name in reg_map:
-                eval_args.append({'type': 'literal', 'val': reg_map[name]})
+            if isinstance(name, str) and platform.is_register(name):
+                eval_args.append({'type': 'literal', 'val': platform.get_register(name)})
                 if is_output:
-                    rd_reg_to_push = reg_map[name]
+                    rd_reg_to_push = platform.get_register(name)
                 continue
                 
             if is_output:
@@ -1015,7 +979,7 @@ class Compiler:
                 sym = self.get_symbol(name)
                 if not sym:
                     platform.push(platform.x0)
-                    self.current_stack_depth += asm.REGISTER_SIZE
+                    self.current_stack_depth += platform.REGISTER_SIZE
                     sym = self.declare_symbol(name)
                     
                 eval_args.append({'type': 'reg', 'val': 5}) 
@@ -1033,7 +997,7 @@ class Compiler:
             tmp_reg = temp_pool[temp_idx]
             temp_idx += 1
             platform.pop(tmp_reg)
-            self.current_stack_depth -= asm.REGISTER_SIZE
+            self.current_stack_depth -= platform.REGISTER_SIZE
             e['reg'] = tmp_reg
             
         for e in eval_args:
@@ -1044,39 +1008,32 @@ class Compiler:
             else:
                 args.append(e['val'])
                 
-        # NEGATIVE SPACE PROGRAMMING: Prevent any structural string bleed into raw hardware functions
         for idx, a in enumerate(args):
-            if inst_name in {"jal", "bge", "blt", "bgeu", "bltu", "beq", "bne", "label"} and idx == len(args) - 1:
+            if platform.is_branch_target(inst_name, idx, len(args)):
                 continue
             assert isinstance(a, int), f"Execution hardware map categorically rejects non-integer binding payload at arg {idx} for '{inst_name}', completely breaking physical constraints. Received '{a}'"
                 
-        asm_method = getattr(asm, inst_name)
-        assert asm_method is not None, f"Dynamic instruction bounds map physically crashed entirely locating absolutely no target sequence parameters executing {inst_name}"
-        asm_method(*args)
+        platform.emit_instruction(inst_name, *args)
         
         if store_back_sym:
             offset = store_back_sym.offset_from_base - self.current_stack_depth
             
-            # STRICT MEMORY ASSERT:
-            assert offset <= -asm.REGISTER_SIZE, f"ASM layout error: Output offset {offset} explicitly points to unallocated stack top (0) instead of overwriting a populated local frame variable"
-            
+            assert offset <= -platform.REGISTER_SIZE, f"ASM layout error: Output offset {offset} explicitly points to unallocated stack top (0) instead of overwriting a populated local frame variable"
             assert offset <= 0, "ASM limits physically prohibit overwriting stack mappings indexing forward entirely corrupting map state parameters targeting strictly negative execution bounds fully allocating variables strictly mapping layout limits exactly allocating bounds entirely"
-            assert offset % asm.REGISTER_SIZE == 0, "ASM output mapping offset completely misaligned structurally bypassing mapped targets entirely"
+            assert offset % platform.REGISTER_SIZE == 0, "ASM output mapping offset completely misaligned structurally bypassing mapped targets entirely"
             
-            asm.store(platform.stack_ptr, offset, platform.t0)
+            platform.write_local(offset, platform.t0)
             
             if self.pure_context_out_var and output_name == self.pure_context_out_var:
                 assert self.current_stack_depth >= 0, "Inline asm bounds execution definitively breached zero stack baseline entirely skipping parameter configurations unconditionally"
                 return
 
-        # CONDITIONAL PUSH: Banned after volatile hardware jumps.
         if has_rd:
             platform.push(rd_reg_to_push)
-            self.current_stack_depth += asm.REGISTER_SIZE
+            self.current_stack_depth += platform.REGISTER_SIZE
         else:
-            # STRICT CONTROL FLOW ASSERT:
             assert rd_reg_to_push == 0, "Execution logically bounded structural limits explicitly restricting returning payload blocks bypassing safe branch mappings unconditionally"
-            assert inst_name in {"store", "sw", "sb", "bge", "blt", "bgeu", "bltu", "beq", "bne", "ecall", "label"}, "Volatile bypass safety assertion caught invalid instruction escaping RD bounds requirement"
+            assert platform.is_volatile_instruction(inst_name), "Volatile bypass safety assertion caught invalid instruction escaping RD bounds requirement"
             
     def Tuple(self, node):
         assert node.node_type == NodeType.Tuple, "Execution parameter sequence requires physically standard map logic directly translating entirely targeting tuple sequences exactly"
@@ -1088,7 +1045,7 @@ class Compiler:
         assert node.value is not None, "Hardware execution sequences completely fail entirely reading structurally unassigned literal sequence components fully mapped mapping targets explicitly bypassing entirely invalid map states executing unconditionally"
         
         platform.push_value(node.value)
-        self.current_stack_depth += asm.REGISTER_SIZE
+        self.current_stack_depth += platform.REGISTER_SIZE
 
     def Deref(self, node):
         assert node.node_type == NodeType.Deref, "Pointer map indirection physically requires fully mapped execution parameters matching strictly target node layout types precisely configuring bounds exclusively bounding mappings"
@@ -1097,13 +1054,13 @@ class Compiler:
         initial_depth = self.current_stack_depth
         self._compile_node(node.left)
         
-        assert self.current_stack_depth == initial_depth + asm.REGISTER_SIZE, "Execution pointer logic mathematically failed pushing exactly one completely verified address bounds physically establishing memory boundary sequence footprint purely"
+        assert self.current_stack_depth == initial_depth + platform.REGISTER_SIZE, "Execution pointer logic mathematically failed pushing exactly one completely verified address bounds physically establishing memory boundary sequence footprint purely"
         
         platform.pop(platform.t0) 
-        self.current_stack_depth -= asm.REGISTER_SIZE
+        self.current_stack_depth -= platform.REGISTER_SIZE
         
-        asm.lw(platform.t1, platform.t0, 0)
+        platform.load_deref(platform.t1, platform.t0)
         platform.push(platform.t1)
-        self.current_stack_depth += asm.REGISTER_SIZE
+        self.current_stack_depth += platform.REGISTER_SIZE
         
-        assert self.current_stack_depth == initial_depth + asm.REGISTER_SIZE, "Target memory layout sequence completely damaged execution stack array limits physically rendering exactly valid mapped offset parameters strictly establishing correct frame physics completely unconditionally mapping bounds executing completely unconditionally"
+        assert self.current_stack_depth == initial_depth + platform.REGISTER_SIZE, "Target memory layout sequence completely damaged execution stack array limits physically rendering exactly valid mapped offset parameters strictly establishing correct frame physics completely unconditionally mapping bounds executing completely unconditionally"
