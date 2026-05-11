@@ -1,6 +1,8 @@
 
 # Work-in-Progress Design Notes
 
+the file's a mess, mostly for just noting down discussion points.
+
 This file tracks active language design questions, planned features, and philosophical tradeoffs that require further definition before hardcoding into the compiler.
 
 ### 1. Zero-Initialization via Type Constructors (Priority 1)
@@ -22,6 +24,29 @@ This file tracks active language design questions, planned features, and philoso
 * **Implicit Calls:** Allow the invocation of a function without parentheses if the context uniquely identifies it, or provide a default fallback (`i` evaluates to `i()` if unbound as a value but exists as a function).
 * **Implicit Assignment / Return Propagation:** In pattern matching or functions, assigning a variable to itself (e.g., `sum = sum;`) or returning the unchanged state should be implicitly handled.
 * **Easy Loops:** Provide a standard macro for simple bounded loops to abstract away the manual recursive pattern matching boilerplate.
+
+
+## 5. Memory, Allocation, and Views
+*   **Pointer Sizing (`[ptr]`):** By default, memory is evaluated at the physical hardware minimum. If a blind pointer dereference is assigned (`[ptr] = 0`), it defaults strictly to a **1-byte view** (the `byte` type). To write larger contiguous blocks, the pointer explicitly requires a lens: `[ptr][int] = 0` tells the compiler to emit a 4-byte write.
+*   **Void-to-Value Allocation:** Variables do not inherently possess a type until initialized via a constructor. 
+    *   An undeclared variable `x` begins as `void`.
+    *   The assignment `x = int(5)` triggers physical stack allocation (Void -> Value). 
+    *   Writing `x = 5` is strictly syntax sugar for `x = int(5)`. The `x[int]` syntax is reserved structurally for input bindings (function parameters or macro holes).
+
+eventually microbinaries for comptime.
+
+
+## 6. Relational Precedence & Macro Overloading
+Hardcoded integer precedence (e.g., binding power `10` for `+`) is phased out in favor of **Relational Precedence via Named Macros**. 
+*   Operators dictate their binding power relative to other known operators/macros (e.g., `before *` or `after ==`). 
+*   **Macro Pattern Matching:** Because macros are now strictly named and relationally anchored, they support the exact same pattern-matching dispatch as standard functions. You can overload a macro by defining multiple patterns under the same identifier; the compiler will match the correct structural expansion at compile time based on the passed AST nodes.
+something int the shape of .@expr(add,a,*,b)mul
+
+
+## 7. Comptime Traps via vm
+When the dynamic dispatch system encounters arguments that fail all patterns, it emits a hardware `ecall` trap. 
+*   To prevent the compiler from emitting a binary that immediately crashes at runtime when arguments are statically known, Phase 2 will introduce a **vm Micro-Binary evaluation step**. 
+*   During compilation, if the AST evaluates a known path that hits a trap, the internal VM will catch the `ecall` natively and immediately throw a hard Compile-Time Error, guaranteeing the binary is never written.
 
 ---
 ### *Resolved Design Decisions*

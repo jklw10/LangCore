@@ -1,74 +1,267 @@
-make assembly notation live possible?
-instead of abusing embed.
+If there's a decision to be made ask, if there's a discrepancy between docs and code or discussion, point it out.
+I'm not using any coding tools, so just output the functions that were changed.
 
+negative space programming, aka asserts everywhere:
+no trivial asserts like assert true or assert out on a value you just assigned.
+assert on values that aren't immediately obvious from the nearby code context what they should be.
 
+during debugging:
+    if i get assembly output:
+        to collect all the logical mistakes happening in the assembly. point out the line numbers in assembly and the approximate locale in the language that most likely defines. i    will then prune the context to just those pieces so give yourself enough context. after you're done with that, i will prune the binary out of this context and give you the    compiler that produced it, and your job is to make asserts that catch the data that caused this error.
+    
+    if i hit an assert:
+        we'll try to fix the errors.
 
-1. Register Abstraction
-Right now, compiler.py hardcodes macros.t0, macros.t1, macros.t2, macros.a0, macros.ra, and macros.x0.
-To be platform-agnostic, platform.py should define logical/virtual registers.
-Decision: Do you agree with mapping these to generic names? For example:
-REG_TEMP_1 (currently t0)
-REG_TEMP_2 (currently t1)
-REG_TEMP_3 (currently t2)
-REG_RETURN (currently a0)
-REG_LINK (currently ra - note: x86 doesn't use a link register, it pushes to the stack, so the platform layer would need to handle this under the hood).
-REG_ZERO (currently x0 - note: x86 doesn't have a zero register, so the platform would simulate it, e.g., by XORing a register with itself).
-2. Instruction Abstraction Level
-How high-level should platform.py be?
-Option A (Low-level agnostic): The compiler asks for arithmetic. platform.add(REG_TEMP_1, REG_TEMP_2)
-Option B (High-level semantic): The compiler asks for behavior. platform.emit_function_call(func_name) or platform.emit_branch_if_greater_equal(REG_TEMP_1, REG_TEMP_2, label).
-Recommendation: Option B is usually better. RISC-V uses jal and jalr for function calls, while x86 uses call and ret. A custom VM might just use invoke. If platform.py handles the semantics of a function call/return, it's much easier to write new backends.
-3. Calling Conventions (ABI) & The Stack
-Currently, compiler.py manually calculates stack depth (self.current_stack_depth -= asm.REGISTER_SIZE) and manually pushes/pops.
-Decision: Should the compiler keep calculating the exact byte offsets for local variables, or should platform.py take over managing the "Stack Frame"? (e.g., platform.store_local(offset, REG_TEMP_1)).
-4. What happens to the @asm macro?
-Your language's standard library relies on @asm(andi, char, char_word, 255). This is explicitly a RISC-V instruction. If the user compiles this file targeting your future Custom VM, it will crash because the VM won't have an andi instruction.
-Decision: How should we handle inline assembly in the future?
-Option A: Scope them by platform. e.g., @asm.riscv(...) and @asm.vm(...). The compiler ignores blocks that don't match the active target platform.
-Option B: Don't worry about it for now (v2.0 problem).
+current task:
 
-looks fine, for x86 and any other we'll just emulate a similar behaviour.
-i think high level in some sense is the whole point, since @asm is accessible from the language itself. brings me to a funny point. i think bin op should only be operator overloads, and by default the platform defines some default overrides for the byte type for runtime? comptime type stuff can probably remain a wild west. or maybe the platform has to define comptime_bytes <-> runtime_byte
-interaction.
-expand on this, common methods of solving, i'm not seeing the full scope.
-A. probably even matched by name. platform selection is definitely v2 though.
+ok the lang docs have gotten a little separated from each other at the moment the compiler itself is ground truth. along with the code defined in todo.md it currently compiles and runs with correct outputs atleast from the limited testing i did:
 
-Expanding on Point 3: Stack Management & ABIs (For v2.0)
-You asked to expand on common methods for solving the "Stack / Calling Convention" problem in platform-agnostic compilers. Here is why your current method breaks across targets, and the two common ways to fix it in v2.0.
-The Problem:
-Right now, compiler.py manually calculates stack offsets (self.current_stack_depth -= 4) and manually pushes/pops arguments.
-If you target RISC-V, arguments 1-8 go into registers (a0-a7), and only arg 9+ goes on the stack.
-If you target 32-bit x86 (cdecl), all arguments go on the stack.
-If you target 64-bit Windows x86, args go in RCX, RDX, R8, R9, plus a mandatory 32-byte "shadow space" on the stack.
-If the AST frontend manages the stack, it has to know all of these rules, defeating the purpose of being platform-agnostic.
-How to solve it in v2.0:
-Method A: The "Frame Manager" Approach (Simpler, Good for 1-pass compilers)
-Instead of tracking current_stack_depth, the AST Visitor asks the Platform backend to allocate logical locals.
-Compiler: sym = platform.declare_local(size=4)
-Platform: Returns a handle like Local(ID=1). Under the hood, the backend notes that Local 1 is at [rbp - 4].
-Compiler: platform.store_local(Local(ID=1), REG_TEMP)
-Compiler: platform.emit_call(func_name, [arg1, arg2]). The platform backend loops through the args and automatically figures out if it needs to emit mov rcx, arg1 (x64) or push arg1 (x86).
-Method B: Infinite Register IR (LLVM / Zig approach, Better for optimization)
-The AST visitor doesn't know what a stack is. It pretends the CPU has 1,000,000 registers (vreg1, vreg2, etc.).
-The compiler transforms a = b + c into:
-code
-Code
-vreg3 = add vreg1, vreg2
-Once the whole function is parsed, the backend takes this IR and maps it to physical registers (t0, t1).
-If the backend runs out of physical registers, the backend itself generates the push/pop instructions to "spill" extra variables to the stack. The frontend is blissfully unaware that the stack even exists.
-Takeaway for your design:
-Given your philosophy of "Types are just Comptime sizes" and transparent memory access, Method A is likely the path of least resistance for v2.0. The platform interface handles the Calling Convention (ABI), and the compiler handles the Data Flow.
+test.w:
+[680 cycles] Memory[65000] received value: 15
+[1422 cycles] Memory[65000] received value: 10
+[1478 cycles] Memory[65000] received value: 12
+[1519 cycles] Memory[65000] received value: 99
 
+Execution finished in 1521 cycles.
+Final SP (x2): 0x00008000
+tokenizer.w:
+asdf
 
-multi function 
-foo:result = (x,y):{}
-foo:result = (x==1,y==2):{}//now a special case that is passed when the params to the function match
+Execution finished in 442 cycles.
+Final SP (x2): 0x00008030
+Final a0 (x10): 6
 
-similar to pattern matching. there might be a nicer way to do this.
-i suppose this might be just the way you do it, but you fool people to think this is just vanilla pattern matching
+this is the final python version of this and will be frozen. we're onto phase 2 unless an actual compiler issue props up.
 
-match = {
-    case:result = (x,y):{}
-    case:result = (x==1,y==2):{}
+i don't care about function names but the decisions that have been made in it's design, i will prune it from context then and we'll move on to the rest one by one. i would like the docs to be generic enough to be useable when this is re-written in .w so no python specifics. ask if there's decisions.
+
+std.w:
+
+bool : value[bool] = (byte[0:1]):{
+    .value = byte;
+    // Control Flow (Null-Denotation / Prefix)
+    .@expr(2, if, cond, t_body) : out = (cond[bool], t_body) : {
+        @asm(beq, cond, zero, skip_body);
+        t_body;
+        @asm(label, skip_body)
+    }
+
+//   v current error position
+    .@expr(8, a, &&, b) : out[bool] = (a[bool], b) : {
+        @asm(and, out, a, b);
+    };
+
+    .@expr(7, a, ||, b) : out[bool] = (a[bool], b) : {
+        @asm(or, out, a, b);
+    };
+
+    .@expr(11, !, a) : out[bool] = (a[bool]) : {
+        @asm(xori, out, a, 1);
+    };
+};
+
+//Math Operators (Left-Denotation / Infix)
+int : value[int] = (bytes[0:4]):{
+    .value = bytes;
+    .max = int(0x7fff);
+    
+    // 1. Math Operators
+    .@expr(10, a, +, b) : out[int] = (a[int], b) : {
+        @asm(add, out, a, b);
+    };
+    .@expr(10, a, -, b) : out[int] = (a[int], b) : {
+        @asm(sub, out, a, b);
+    };
+    .@expr(9, a, <, b) : out[bool] = (a[int], b) : {
+        @asm(slt, out, a, b);
+    };
+    .@expr(9, a, >, b) : out[bool] = (a[int], b) : {
+        @asm(slt, out, b, a);
+    };
+    .@expr(9, a, <=, b) : out[bool] = (a[int], b) : {
+        @asm(slt, out, b, a);
+        @asm(xori, out, out, 1); // !(b < a) => a <= b
+    };
+    .@expr(9, a, >=, b) : out[bool] = (a[int], b) : {
+        @asm(slt, out, a, b);
+        @asm(xori, out, out, 1); // !(a < b) => a >= b
+    };
+    .@expr(9, a, ==, b) : out[bool] = (a[int], b) : {
+        @asm(sub, out, a, b);
+        @asm(sltiu, out, out, 1);
+    };
+    .@expr(9, a, !=, b) : out[bool] = (a[int], b) : {
+        @asm(sub, out, a, b);
+        @asm(sltu, out, zero, out); // if (a-b) != 0, 0 < unsigned(a-b) is true
+    };
+
+    .rand : value[int] = ():{
+        value = 4; //decided by fair dice
+    }
+};
+sys : value[int] = (bytes[0:0]): {
+    .read_stdin : bytes_read[int] = (dest_ptr[int], max_len[int]) : {
+        @asm(addi, x17, zero, 3); // Syscall 3: Read
+        @asm(add, x11, zero, dest_ptr);
+        @asm(add, x12, zero, max_len);
+        @asm(ecall);
+        @asm(add, bytes_read, zero, x10); // Returns bytes read in a0
+    };
+
+    .write : _ = (ptr[int], len[int]) : {
+        @asm(addi, x17, zero, 2); // Syscall 2: Write stdout
+        @asm(add, x11, zero, ptr);
+        @asm(add, x12, zero, len);
+        @asm(ecall);
+    };
+
+    .print_int : _ = (val[int]) : {
+        @asm(addi, x17, zero, 1); // Syscall 1: Print Int
+        @asm(add, x10, zero, val);
+        @asm(ecall);
+    };
+    .@expr(2, assert, cond) : _ = (cond[bool]) : {
+        @asm(bne, cond, zero, assert_ok);
+        @asm(addi, x17, zero, 0); 
+        @asm(ecall);
+        @asm(label, assert_ok);
+    };
 }
-"hey look, it's a match statement" :^)
+
+
+
+tokenizer.w:
+@import(tests/std.w);
+
+@using(bool);
+@using(int);
+@using(sys);
+
+SOURCE_PTR = 1000; //we live in hope
+MAX_LEN = 4096;
+
+// Function to read a single byte (Since we don't have [byte] lens yet)
+read_byte : val[int] = (ptr[int]) : {
+    // (inst, rd, rs1, offset) this little swizzle is another reason i'll look into making a real VM.
+    @asm(lbu, val, ptr, 0); 
+};
+
+// --- Lexer State Machine ---
+// loop signature: (is_done, current_ptr, max_ptr)
+parse_loop : _ = (1, ptr[int], max_ptr[int]) : {
+    // Done!
+};
+
+parse_loop : _ = (0, ptr[int], max_ptr[int]) : {
+    char = read_byte(ptr);
+    
+    // Check if whitespace (space = 32, \n = 10)
+    is_space = char == 32;
+    is_newline = char == 10;
+    
+    // Negative Space constraint: we assert char is within ASCII bounds
+    assert(char < 128);
+
+    if (is_space) {
+        // Skip
+    };
+    
+    if (is_newline) {
+        // Increment line number (to be implemented)
+    };
+
+    // TODO: Implement digit checks (char >= 48 && char <= 57)
+    // TODO: Implement identifier checks
+
+    // Recurse to next byte
+    next_ptr = ptr + 1;
+    is_done = next_ptr == max_ptr;
+    
+    _ = parse_loop(is_done, next_ptr, max_ptr);
+};
+
+
+// --- Main Execution ---
+bytes_read = sys.read_stdin(SOURCE_PTR, MAX_LEN);
+
+// Assert we actually read a file
+assert(bytes_read > 0);
+
+// Start State Machine
+end_ptr = SOURCE_PTR + bytes_read;
+_ = parse_loop(0, SOURCE_PTR, end_ptr);
+
+
+test.w:
+
+bool : value[bool] = (byte[0:1]):{
+    .value = byte;
+    // Control Flow (Null-Denotation / Prefix)
+    .@expr(2, if, cond, t_body) : out = (cond[bool], t_body) : {
+        @asm(beq, cond, zero, skip_body);
+        t_body;
+        @asm(label, skip_body)
+    }
+};
+
+//Math Operators (Left-Denotation / Infix)
+int : value[int] = (bytes[0:4]):{
+    .value = bytes;
+    .max = int(0x7fff);
+    .@expr(10, a, +, b) : out[int] = (a[int], b) : {
+        @asm(add, out, a, b);
+    };
+
+    .@expr(10, a, -, b) : out[int] = (a[int], b) : {
+        @asm(sub, out, a, b);
+    };
+    //2. Logic Operators
+    .@expr(9, a, <, b) : out[bool] = (a[int], b) : {
+        @asm(slt, out, a, b);
+    };
+    .@expr(9, a, >=, b) : out[bool] = (a[int], b) : {
+        @asm(slt, out, b, a);
+    };
+    .@expr(9, a, ==, b) : out[bool] = (a[int], b) : {
+        @asm(sub, out, a, b);
+        @asm(sltiu, out, out, 1);
+    };
+    .rand : value[int] = ():{
+        value = 4; //decided by fair dice
+    }
+};
+@using(bool);
+@using(int);
+
+// Temporal loop pipeline
+loop : sum[int], [ptr] = (0, i[int], sum[int], ptr) : {
+    sum = sum;
+} 
+loop : sum[int], [ptr] = (1, i[int], sum[int], ptr) : {
+    sum = sum + i;
+    
+    // (sum == 15) a [bool], triggering the 'if' macro!
+    if (sum == 15) {
+        [ptr] = sum;
+    };
+
+    sum, [ptr] = loop(i<10, i + 1, sum, ptr);
+};
+
+i[int] = 0;
+sum[int] = 0;
+ptr = 65000;
+sum, [ptr] = loop(1, i, sum, ptr)
+
+
+// Function Definitions dynamically returning an [int] type 
+// i need to look into defining 2[int] or int(2) as input types instead of assuming type here:
+
+foo : res[int] = (1, 2) : { res = 10 };
+foo : res[int] = (x, 2) : { res = x + 10 };
+foo : res[int] = (x, y) : { res = 99 };
+
+[65000] = foo(1, 2); // Will be 10
+[65000] = foo(2, 2); // Will be 20
+[65000] = foo(5, 5); // Will be 99
+
