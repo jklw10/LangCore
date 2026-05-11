@@ -1,4 +1,5 @@
-The main idea is to have a language that you have to define just about everything about how you use data.
+The main idea is to have a language that you have to define just about everything about the language.
+original idea was a language you can define as you write it, so [yacc](https://en.wikipedia.org/wiki/Yacc) with extra steps
 
 Language documentation sanity is: surface level verified gemini output.
 
