@@ -22,6 +22,7 @@ class Token:
 # A unified regex that captures tokens sequentially
 TOKEN_PATTERN = re.compile(
     r'(?P<COMMENT>//.*)|'
+    r'(?P<STRING>"[^"]*")|'
     r'(?P<WS>\s+)|'
     r'(?P<SYMBOL>==|!=|<=|>=|[*()\^/=\+\-!|&<>\[\]{}:;,.@?])|'
     r'(?P<HEX>0x[0-9a-fA-F_]+)|'
@@ -55,6 +56,11 @@ def tokenize(text: str) -> list[Token]:
             tokens_out.append(Token(TokenType.VALUE, int(clean_val, base), line, col))
         elif kind == 'IDENT':
             tokens_out.append(Token(TokenType.IDENTIFIER, val, line, col))
+            
+        elif kind == 'STRING':
+            clean_str = val[1:-1].encode('utf-8').decode('unicode_escape')
+            tokens_out.append(Token(TokenType.VALUE, clean_str, line, col))
+            #tokens_out.append(Token(TokenType.VALUE, val[1:-1], line, col))
         else:
             raise SyntaxError(f"Lexer Error: Unexpected sequence '{val}' at line {line}, col {col}")
 

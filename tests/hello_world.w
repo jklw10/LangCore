@@ -1,5 +1,3 @@
 @import(tests/std.w);
-@using(sys);
-
-ptr, length = @embed(tests/hw.txt);
-sys.write(ptr, length);
+.str = "hello world";
+sys.write(.str[0], .str[1]);

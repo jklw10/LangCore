@@ -19,7 +19,8 @@ class NodeType(Enum):
     Deref = auto()    
     Call = auto()            
     FunctionDef = auto()    
-    CallerContext = auto()     
+    CallerContext = auto()  
+    Slice = auto()           
 
 @dataclass
 class ASTNode:
@@ -406,11 +407,20 @@ class Parser:
                     raise SyntaxError(f"Syntax Error at line {t.line}:{t.col} -> Cannot call non-identifier {getattr(left, 'value', left)}")
 
             if t.value == '[':
-                type_expr = self.parse_expr(0)
-                assert type_expr is not None, "Type annotation bracket cannot be empty"
+                inner_expr = self.parse_expr(0)
+                assert inner_expr is not None, "Bracket cannot be empty"
                 self.match(']')
                 
-                type_name = build_type_name(type_expr)
+                is_slice = False
+                if inner_expr.node_type == NodeType.Pipeline: 
+                    is_slice = True
+                elif inner_expr.node_type == NodeType.Value and isinstance(inner_expr.value, int):
+                    is_slice = True
+
+                if is_slice:
+                    return ASTNode(NodeType.Slice, left=left, children=[inner_expr], line=t.line, col=t.col)
+
+                type_name = build_type_name(inner_expr)
                 assert type_name, "Failed to resolve type name from annotation"
                 left.type_name = type_name
                 

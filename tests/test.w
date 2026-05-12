@@ -38,10 +38,11 @@ int : value[int] = (bytes[0:4]):{
 @using(bool);
 @using(int);
 
-// Temporal loop pipeline
+// loop i >= 10 branch
 loop : sum[int], [ptr] = (0, i[int], sum[int], ptr) : {
     sum = sum;
 } 
+// loop i < 10 branch
 loop : sum[int], [ptr] = (1, i[int], sum[int], ptr) : {
     sum = sum + i;
     

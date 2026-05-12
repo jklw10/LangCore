@@ -14,8 +14,27 @@ during debugging:
 
 current task:
 
+strings, but declaration only allowed at the "top" (root) of type/namespace definitions, a file is a namespace/type
+this is a namespace/type to store some bindings.
+a middle ground between no strings, and yes strings.
+
+Bindings : self[Bindings] = (_[0:0]) : {
+ .transform = "u_transform";
+ .color     = "u_color";
+ .fmt_int   = "Value: %d\n";
+ .loop : sum = (i) : {
+    // ERROR: Cannot allocate static .rodata inside a dynamic stack scope.
+    loc = glGetUniformLocation(shader, "u_transform"); 
+    
+    // VALID: Passing the pointer to the static memory.
+    loc = glGetUniformLocation(shader, .transform);
+    
+    printf(Bindings.fmt_int, loc);
+ }
+}
 
 std.w:
+
 
 bool : value[bool] = (byte[0:1]):{
     .value = byte;
@@ -24,9 +43,7 @@ bool : value[bool] = (byte[0:1]):{
         @asm(beq, cond, zero, skip_body);
         t_body;
         @asm(label, skip_body)
-    }
-
-//   v current error position
+    };
     .@expr(8, a, &&, b) : out[bool] = (a[bool], b) : {
         @asm(and, out, a, b);
     };
@@ -77,8 +94,9 @@ int : value[int] = (bytes[0:4]):{
 
     .rand : value[int] = ():{
         value = 4; //decided by fair dice
-    }
+    };
 };
+//does this need a shorthand?:
 sys : value[int] = (bytes[0:0]): {
     .read_stdin : bytes_read[int] = (dest_ptr[int], max_len[int]) : {
         @asm(addi, x17, zero, 3); // Syscall 3: Read
@@ -88,13 +106,18 @@ sys : value[int] = (bytes[0:0]): {
         @asm(add, bytes_read, zero, x10); // Returns bytes read in a0
     };
 
-    .write : _ = (ptr[int], len[int]) : {
-        @asm(addi, x17, zero, 2); // Syscall 2: Write stdout
+    .read : [ptr] = (ptr[int], len[int]) : {
+        @asm(addi, x17, zero, 3); // Syscall 3: read stdout
         @asm(add, x11, zero, ptr);
         @asm(add, x12, zero, len);
         @asm(ecall);
     };
-
+    .write : _ = (ptr[int], len[int]) : {
+        @asm(addi, x17, zero, 2); // Syscall 2: write stdout
+        @asm(add, x11, zero, ptr);
+        @asm(add, x12, zero, len);
+        @asm(ecall);
+    };
     .print_int : _ = (val[int]) : {
         @asm(addi, x17, zero, 1); // Syscall 1: Print Int
         @asm(add, x10, zero, val);
@@ -102,15 +125,16 @@ sys : value[int] = (bytes[0:0]): {
     };
     .@expr(2, assert, cond) : _ = (cond[bool]) : {
         @asm(bne, cond, zero, assert_ok);
-        @asm(addi, x17, zero, 0); 
+        // If condition is 0 (false), crash immediately
+        @asm(addi, x17, zero, 0); // Syscall 0: HALT
         @asm(ecall);
         @asm(label, assert_ok);
     };
 }
 
 
-
 tokenizer.w:
+
 @import(tests/std.w);
 
 @using(bool);
@@ -122,7 +146,8 @@ MAX_LEN = 4096;
 
 // Function to read a single byte (Since we don't have [byte] lens yet)
 read_byte : val[int] = (ptr[int]) : {
-    // (inst, rd, rs1, offset) this little swizzle is another reason i'll look into making a real VM.
+    // raw assembly to load byte unsigned (lbu) into 'val'
+    // Corrected positional arguments: (inst, rd, rs1, offset)
     @asm(lbu, val, ptr, 0); 
 };
 
@@ -213,10 +238,11 @@ int : value[int] = (bytes[0:4]):{
 @using(bool);
 @using(int);
 
-// Temporal loop pipeline
+// loop i >= 10 branch
 loop : sum[int], [ptr] = (0, i[int], sum[int], ptr) : {
     sum = sum;
 } 
+// loop i < 10 branch
 loop : sum[int], [ptr] = (1, i[int], sum[int], ptr) : {
     sum = sum + i;
     
@@ -233,9 +259,8 @@ sum[int] = 0;
 ptr = 65000;
 sum, [ptr] = loop(1, i, sum, ptr)
 
-
 // Function Definitions dynamically returning an [int] type 
-// i need to look into defining 2[int] or int(2) as input types instead of assuming type here:
+// i need to look into forcing 2[int] or int(2) as input types instead of assuming type here:
 
 foo : res[int] = (1, 2) : { res = 10 };
 foo : res[int] = (x, 2) : { res = x + 10 };
@@ -244,4 +269,3 @@ foo : res[int] = (x, y) : { res = 99 };
 [65000] = foo(1, 2); // Will be 10
 [65000] = foo(2, 2); // Will be 20
 [65000] = foo(5, 5); // Will be 99
-

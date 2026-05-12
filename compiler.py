@@ -288,9 +288,34 @@ class Compiler:
         assert isinstance(node.value, str) and node.value, "Raw identifier entity maps to an uninitialized runtime value"
         assert self.current_stack_depth >= 0, "Stack pointer baseline corrupted prior to identifier evaluation"
         
-        if hasattr(self, 'static_fields') and node.value in self.static_fields:
-            platform.push_value(self.static_fields[node.value])
-            self.current_stack_depth += platform.REGISTER_SIZE
+        name = node.value
+        if name.startswith(".") and getattr(self, 'current_type_context', None):
+            name = self.current_type_context + name
+
+        if hasattr(self, 'static_fields') and name in self.static_fields:
+            val = self.static_fields[name]
+            if isinstance(val, str):
+                # Strings inherently behave as explicit static @embed blocks
+                data = val.encode('utf-8')
+                skip_label = self.get_unique_label("skip_str")
+                platform.jump_and_link(platform.t0, skip_label)
+                platform.emit_bytes(data)
+                
+                padding = (platform.REGISTER_SIZE - (len(data) % platform.REGISTER_SIZE)) % platform.REGISTER_SIZE
+                if padding > 0:
+                    platform.emit_bytes(b'\x00' * padding)
+                    
+                platform.label(skip_label)
+                
+                # Push the absolute memory pointer
+                platform.push(platform.t0)
+                self.current_stack_depth += platform.REGISTER_SIZE
+                # Push the physical byte length
+                platform.push_value(len(data))
+                self.current_stack_depth += platform.REGISTER_SIZE
+            else:
+                platform.push_value(val)
+                self.current_stack_depth += platform.REGISTER_SIZE
             return
 
         sym = self.get_symbol(node.value)
@@ -366,13 +391,21 @@ class Compiler:
         offset = 0
         for p in reversed(pat_args):
             offset -= platform.REGISTER_SIZE
-            assert p.node_type in (NodeType.Identifier, NodeType.Value, NodeType.Tuple), f"Evaluation expects standard AST signature pattern parameter, got {p.node_type}"
+            assert p.node_type in (NodeType.Identifier, NodeType.Value, NodeType.Tuple, NodeType.Slice), f"Evaluation expects standard AST signature pattern parameter, got {p.node_type}"
+            
+            p_name = None
             if p.node_type == NodeType.Identifier:
-                assert offset <= -platform.REGISTER_SIZE, f"Hardware layout error: Parameter '{p.value}' mapping offset is {offset}, explicitly overlapping caller's unallocated SP tip. Must be strictly negative."
+                p_name = p.value
+            elif p.node_type == NodeType.Slice:
+                assert getattr(p.left, 'node_type', None) == NodeType.Identifier, "Slice parameter base must be an identifier"
+                p_name = p.left.value
+                
+            if p_name is not None:
+                assert offset <= -platform.REGISTER_SIZE, f"Hardware layout error: Parameter '{p_name}' mapping offset is {offset}, explicitly overlapping caller's unallocated SP tip. Must be strictly negative."
                 info = SymbolInfo(offset_from_base=offset)
-                assert info.offset_from_base <= 0, f"Hardware layout error: Parameter '{p.value}' must occupy a non-positive base offset reflecting the caller's stack frame"
+                assert info.offset_from_base <= 0, f"Hardware layout error: Parameter '{p_name}' must occupy a non-positive base offset reflecting the caller's stack frame"
                 assert info.offset_from_base % platform.REGISTER_SIZE == 0, "Caller parameter transmission offset must fall exactly on strict register boundaries"
-                self.scopes[-1][p.value] = info
+                self.scopes[-1][p_name] = info
             
         assert offset == -len(pat_args) * platform.REGISTER_SIZE, "Frame mapping mathematics critically bypassed evaluating standard parameter footprint structures"
         
@@ -441,7 +474,6 @@ class Compiler:
         
         platform.label(skip_label)
         assert self.current_stack_depth == old_stack_depth, "Parent scope map fatally injured compiling dynamic child layout definition footprint"
-    
     
     def Call(self, node):
         assert node.node_type == NodeType.Call, "Node operation request branch incorrectly evaluates logic map"
@@ -594,6 +626,57 @@ class Compiler:
                 
         assert self.current_stack_depth == initial_depth + (max(num_returns, 1) * platform.REGISTER_SIZE), "Execution framework entirely missed safe register pushing logic requirements post-call evaluation block"
 
+    def Slice(self, node):
+        assert getattr(node, 'node_type', None) == NodeType.Slice, "Routing explicitly requires Slice mapped node structures"
+        
+        initial_depth = self.current_stack_depth
+        
+        # 1. Evaluate the base footprint (e.g., .str physically pushes 2 registers)
+        self._compile_node(node.left)
+        pushed_base_bytes = self.current_stack_depth - initial_depth
+        assert pushed_base_bytes >= platform.REGISTER_SIZE, "Slice base evaluation fundamentally failed establishing physical hardware layout"
+
+        total_elements = pushed_base_bytes // platform.REGISTER_SIZE
+        inner = node.children[0]
+        
+        # 2. Resolve bounds natively
+        if inner.node_type == NodeType.Value:
+            # [0] -> [0:0] behavior natively applied
+            start_idx = inner.value
+            end_idx = inner.value
+        elif inner.node_type == NodeType.Pipeline:
+            # [0:1] bounds
+            assert inner.left.node_type == NodeType.Value, "Slice start must be a compile-time static integer for DOD tuples"
+            assert inner.right.node_type == NodeType.Value, "Slice end must be a compile-time static integer for DOD tuples"
+            start_idx = inner.left.value
+            end_idx = inner.right.value
+        else:
+            raise NotImplementedError("Dynamic slice bounds requiring runtime logic not yet implemented")
+
+        if end_idx == -1:
+            end_idx = total_elements - 1
+
+        assert 0 <= start_idx <= end_idx < total_elements, f"Slice bounds [{start_idx}:{end_idx}] physically breach stack sequence size {total_elements} for '{getattr(node.left, 'value', 'expr')}'"
+
+        elements_to_keep = (end_idx - start_idx) + 1
+        
+        # 3. Pluck the requested registers from the pushed sequence
+        temp_regs = platform.get_temp_regs_for_tco(elements_to_keep)
+        for i in range(elements_to_keep):
+            # Index 0 is mathematically the "bottom" register (the one pushed first)
+            offset_from_top = pushed_base_bytes - ((start_idx + i) * platform.REGISTER_SIZE)
+            platform.read_local(temp_regs[i], -offset_from_top)
+            
+        # 4. Obliterate the old flat sequence entirely to prevent leaks
+        platform.shrink_stack(pushed_base_bytes)
+        self.current_stack_depth -= pushed_base_bytes
+        
+        # 5. Push ONLY the exact requested isolated slices back onto the active stack tip
+        for i in range(elements_to_keep):
+            platform.push(temp_regs[i])
+            self.current_stack_depth += platform.REGISTER_SIZE
+
+        assert self.current_stack_depth == initial_depth + (elements_to_keep * platform.REGISTER_SIZE), "Slice sequence physically failed strict layout reversion boundaries"
     
     def Assignment(self, node):
         assert node.node_type == NodeType.Assignment, "Operator node routing misaligned completely bypassing strict framework typing"
@@ -855,6 +938,10 @@ class Compiler:
     def Program(self, node):
         assert node.node_type == NodeType.Program, "Program execution strict parameter mapping demands immediate top level boundary configuration nodes entirely mapping entry execution blocks"
         
+        # Implicit top-level namespace initialization
+        old_ctx = getattr(self, 'current_type_context', None)
+        self.current_type_context = "main"
+        
         start_depth = self.current_stack_depth
         for child in node.children:
             self._compile_node(child)
@@ -865,6 +952,7 @@ class Compiler:
             platform.shrink_stack(diff)
             self.current_stack_depth = start_depth
             
+        self.current_type_context = old_ctx
         platform.halt()
 
     def MacroDef(self, node):
@@ -1047,8 +1135,11 @@ class Compiler:
             self._compile_node(child)
 
     def Value(self, node):
+
         assert node.node_type == NodeType.Value, "Immediate literal payload push execution exclusively maps strict logic tree boundary entirely verifying target nodes strictly formatting sequence mapping layouts completely"
         assert node.value is not None, "Hardware execution sequences completely fail entirely reading structurally unassigned literal sequence components fully mapped mapping targets explicitly bypassing entirely invalid map states executing unconditionally"
+        if isinstance(node.value, str):
+            raise SyntaxError(f"Cannot allocate static .rodata inside a dynamic stack scope at {node.line}:{node.col}. Bind strings as namespace statics instead.")
         
         platform.push_value(node.value)
         self.current_stack_depth += platform.REGISTER_SIZE
