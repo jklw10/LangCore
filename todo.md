@@ -14,24 +14,7 @@ during debugging:
 
 current task:
 
-strings, but declaration only allowed at the "top" (root) of type/namespace definitions, a file is a namespace/type
-this is a namespace/type to store some bindings.
-a middle ground between no strings, and yes strings.
-
-Bindings : self[Bindings] = (_[0:0]) : {
- .transform = "u_transform";
- .color     = "u_color";
- .fmt_int   = "Value: %d\n";
- .loop : sum = (i) : {
-    // ERROR: Cannot allocate static .rodata inside a dynamic stack scope.
-    loc = glGetUniformLocation(shader, "u_transform"); 
-    
-    // VALID: Passing the pointer to the static memory.
-    loc = glGetUniformLocation(shader, .transform);
-    
-    printf(Bindings.fmt_int, loc);
- }
-}
+simplification of code
 
 std.w:
 

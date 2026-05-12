@@ -165,6 +165,17 @@ class Compiler:
         assert self.current_stack_depth == 0, f"Compilation fully leaked structural hardware memory frame bounds maintaining unresolved {self.current_stack_depth} byte total footprint sequence"
         return platform
     
+    def validate_and_get_offset(self, target_offset_from_base, name: str, negative = False) -> int:
+        offset = target_offset_from_base - self.current_stack_depth
+        assert offset <= -platform.REGISTER_SIZE, f"Memory read error: Calculated offset {offset} for '{name}' reads the unallocated stack tip."
+        if negative:
+            assert offset <= 0, f"CRITICAL: Assignment logic mapped overwrite target mathematically shifting into upper memory unallocated '{name}' footprint boundaries!"
+            assert offset <= 0, f"CRITICAL BUG: Memory offset {offset} for '{name}' is positive. Stack physics mandate reading old variables at negative offsets below the upward-growing SP!"
+            assert offset <= 0, f"Hardware layout error: Parameter '{name}' must occupy a non-positive base offset reflecting the caller's stack frame"
+
+        assert offset % platform.REGISTER_SIZE == 0, f"Hardware offset memory fetch definitively broke structural alignment bounds: {offset}"
+        return offset
+
     def _register_functions(self, node: ASTNode, current_type_context=None):
         if not node: 
             return
@@ -250,7 +261,21 @@ class Compiler:
         visitor = getattr(self, method_name, self.error)
         
         return visitor(node)
+      
+    def _ast_nodes_equal(self, n1, n2):
+        if n1 is None and n2 is None: return True
+        if n1 is None or n2 is None: return False
+        assert hasattr(n1, 'node_type') and hasattr(n2, 'node_type'), "Structural map comparisons must strictly exclusively analyze identical AST framework nodes"
         
+        if n1.node_type != n2.node_type: return False
+        if n1.value != n2.value: return False
+        if len(n1.children) != len(n2.children): return False
+        for c1, c2 in zip(n1.children, n2.children):
+            if not self._ast_nodes_equal(c1, c2): return False
+        if not self._ast_nodes_equal(n1.left, n2.left): return False
+        if not self._ast_nodes_equal(n1.right, n2.right): return False
+        return True
+    
     def error(self, node):
         raise NotImplementedError(f"CRITICAL: Unmapped evaluation method for AST structure {node.node_type} at line {node.line}:{node.col}")
     
@@ -329,10 +354,9 @@ class Compiler:
             
         offset = sym.offset_from_base - self.current_stack_depth
         
-        assert offset <= -platform.REGISTER_SIZE, f"Memory read error: Calculated offset {offset} for '{node.value}' reads the unallocated stack tip (0(sp)). Must read physically populated negative frame space."
-        assert offset <= 0, f"CRITICAL BUG: Memory offset {offset} for '{node.value}' is positive. Stack physics mandate reading old variables at negative offsets below the upward-growing SP!"
+        self.validate_and_get_offset(sym.offset_from_base, node.value, negative=True)
+        #questionable magic value. define in platform.
         assert abs(offset) < (15 * platform.REGISTER_SIZE), f"Memory offset {offset} for '{node.value}' exceeds all logical bounds of the caller frame map footprint."
-        assert offset % platform.REGISTER_SIZE == 0, f"Hardware offset memory fetch definitively broke structural alignment bounds: {offset}"
         
         platform.read_local(platform.t0, offset) 
         platform.push(platform.t0)
@@ -391,20 +415,18 @@ class Compiler:
         offset = 0
         for p in reversed(pat_args):
             offset -= platform.REGISTER_SIZE
-            assert p.node_type in (NodeType.Identifier, NodeType.Value, NodeType.Tuple, NodeType.Slice), f"Evaluation expects standard AST signature pattern parameter, got {p.node_type}"
+            assert p.node_type in (NodeType.Identifier, NodeType.Value, NodeType.Tuple, NodeType.Lens), f"Evaluation expects standard AST signature pattern parameter, got {p.node_type}"
             
             p_name = None
             if p.node_type == NodeType.Identifier:
                 p_name = p.value
-            elif p.node_type == NodeType.Slice:
-                assert getattr(p.left, 'node_type', None) == NodeType.Identifier, "Slice parameter base must be an identifier"
+            elif p.node_type == NodeType.Lens:
+                assert p.left is not None and p.left.node_type == NodeType.Identifier, "Lens parameter base must be an identifier"
                 p_name = p.left.value
                 
             if p_name is not None:
-                assert offset <= -platform.REGISTER_SIZE, f"Hardware layout error: Parameter '{p_name}' mapping offset is {offset}, explicitly overlapping caller's unallocated SP tip. Must be strictly negative."
                 info = SymbolInfo(offset_from_base=offset)
-                assert info.offset_from_base <= 0, f"Hardware layout error: Parameter '{p_name}' must occupy a non-positive base offset reflecting the caller's stack frame"
-                assert info.offset_from_base % platform.REGISTER_SIZE == 0, "Caller parameter transmission offset must fall exactly on strict register boundaries"
+                self.validate_and_get_offset(offset, node.value, negative=True)
                 self.scopes[-1][p_name] = info
             
         assert offset == -len(pat_args) * platform.REGISTER_SIZE, "Frame mapping mathematics critically bypassed evaluating standard parameter footprint structures"
@@ -474,7 +496,6 @@ class Compiler:
         
         platform.label(skip_label)
         assert self.current_stack_depth == old_stack_depth, "Parent scope map fatally injured compiling dynamic child layout definition footprint"
-    
     def Call(self, node):
         assert node.node_type == NodeType.Call, "Node operation request branch incorrectly evaluates logic map"
         assert isinstance(node.value, str) and node.value, "Invocation mechanism maps entirely blank execution bounds"
@@ -567,11 +588,9 @@ class Compiler:
                 
                 for i, reg in enumerate(reversed(temp_regs)):
                     target_offset_from_base = -platform.REGISTER_SIZE * (i + 1)
-                    assert target_offset_from_base <= -platform.REGISTER_SIZE, f"TCO layout error: Overwrite target offset for arg {i} is {target_offset_from_base}, fatally corrupting the unallocated caller SP tip."
-
+                    
                     offset = target_offset_from_base - self.current_stack_depth
-                    assert offset <= -platform.REGISTER_SIZE, f"CRITICAL TCO LEAK: Overwrite boundary offset {offset} must explicitly calculate downward entirely reaching caller parameter maps"
-                    assert offset % platform.REGISTER_SIZE == 0, "TCO parameter overwrite misaligned structurally bypassing valid map configurations"
+                    self.validate_and_get_offset(target_offset_from_base, node.value)
                     
                     platform.write_local(offset, reg)
                     
@@ -626,58 +645,73 @@ class Compiler:
                 
         assert self.current_stack_depth == initial_depth + (max(num_returns, 1) * platform.REGISTER_SIZE), "Execution framework entirely missed safe register pushing logic requirements post-call evaluation block"
 
-    def Slice(self, node):
-        assert getattr(node, 'node_type', None) == NodeType.Slice, "Routing explicitly requires Slice mapped node structures"
+    def Lens(self, node):
+        assert getattr(node, 'node_type', None) == NodeType.Lens, "Routing explicitly requires Lens mapped node structures"
         
         initial_depth = self.current_stack_depth
         
-        # 1. Evaluate the base footprint (e.g., .str physically pushes 2 registers)
-        self._compile_node(node.left)
-        pushed_base_bytes = self.current_stack_depth - initial_depth
-        assert pushed_base_bytes >= platform.REGISTER_SIZE, "Slice base evaluation fundamentally failed establishing physical hardware layout"
-
-        total_elements = pushed_base_bytes // platform.REGISTER_SIZE
-        inner = node.children[0]
-        
-        # 2. Resolve bounds natively
-        if inner.node_type == NodeType.Value:
-            # [0] -> [0:0] behavior natively applied
-            start_idx = inner.value
-            end_idx = inner.value
-        elif inner.node_type == NodeType.Pipeline:
-            # [0:1] bounds
-            assert inner.left.node_type == NodeType.Value, "Slice start must be a compile-time static integer for DOD tuples"
-            assert inner.right.node_type == NodeType.Value, "Slice end must be a compile-time static integer for DOD tuples"
-            start_idx = inner.left.value
-            end_idx = inner.right.value
-        else:
-            raise NotImplementedError("Dynamic slice bounds requiring runtime logic not yet implemented")
-
-        if end_idx == -1:
-            end_idx = total_elements - 1
-
-        assert 0 <= start_idx <= end_idx < total_elements, f"Slice bounds [{start_idx}:{end_idx}] physically breach stack sequence size {total_elements} for '{getattr(node.left, 'value', 'expr')}'"
-
-        elements_to_keep = (end_idx - start_idx) + 1
-        
-        # 3. Pluck the requested registers from the pushed sequence
-        temp_regs = platform.get_temp_regs_for_tco(elements_to_keep)
-        for i in range(elements_to_keep):
-            # Index 0 is mathematically the "bottom" register (the one pushed first)
-            offset_from_top = pushed_base_bytes - ((start_idx + i) * platform.REGISTER_SIZE)
-            platform.read_local(temp_regs[i], -offset_from_top)
+        if node.left is None:
+            # Prefix Lens logic (Pointer Deref) -> [ptr]
+            self._compile_node(node.right)
             
-        # 4. Obliterate the old flat sequence entirely to prevent leaks
-        platform.shrink_stack(pushed_base_bytes)
-        self.current_stack_depth -= pushed_base_bytes
-        
-        # 5. Push ONLY the exact requested isolated slices back onto the active stack tip
-        for i in range(elements_to_keep):
-            platform.push(temp_regs[i])
+            assert self.current_stack_depth == initial_depth + platform.REGISTER_SIZE, "Execution pointer logic mathematically failed pushing exactly one completely verified address bounds physically establishing memory boundary sequence footprint purely"
+            
+            platform.pop(platform.t0) 
+            self.current_stack_depth -= platform.REGISTER_SIZE
+            
+            platform.load_deref(platform.t1, platform.t0)
+            platform.push(platform.t1)
             self.current_stack_depth += platform.REGISTER_SIZE
+            
+            assert self.current_stack_depth == initial_depth + platform.REGISTER_SIZE, "Target memory layout sequence completely damaged execution stack array limits physically rendering exactly valid mapped offset parameters strictly establishing correct frame physics completely unconditionally mapping bounds executing completely unconditionally"
+        else:
+            # Infix Lens logic (Slice / Data Pluck) -> arr[0:4]
+            # 1. Evaluate the base footprint (e.g., .str physically pushes 2 registers)
+            self._compile_node(node.left)
+            pushed_base_bytes = self.current_stack_depth - initial_depth
+            assert pushed_base_bytes >= platform.REGISTER_SIZE, "Lens base evaluation fundamentally failed establishing physical hardware layout"
 
-        assert self.current_stack_depth == initial_depth + (elements_to_keep * platform.REGISTER_SIZE), "Slice sequence physically failed strict layout reversion boundaries"
-    
+            total_elements = pushed_base_bytes // platform.REGISTER_SIZE
+            inner = node.right
+            
+            # 2. Resolve bounds natively
+            if inner.node_type == NodeType.Value:
+                # [0] -> [0:0] behavior natively applied
+                start_idx = inner.value
+                end_idx = inner.value
+            elif inner.node_type == NodeType.Pipeline:
+                # [0:1] bounds
+                assert inner.left.node_type == NodeType.Value, "Lens start must be a compile-time static integer for DOD tuples"
+                assert inner.right.node_type == NodeType.Value, "Lens end must be a compile-time static integer for DOD tuples"
+                start_idx = inner.left.value
+                end_idx = inner.right.value
+            else:
+                raise NotImplementedError("Dynamic slice bounds requiring runtime logic not yet implemented")
+
+            if end_idx == -1:
+                end_idx = total_elements - 1
+
+            assert 0 <= start_idx <= end_idx < total_elements, f"Lens bounds [{start_idx}:{end_idx}] physically breach stack sequence size {total_elements} for '{getattr(node.left, 'value', 'expr')}'"
+
+            elements_to_keep = (end_idx - start_idx) + 1
+            
+            # 3. Pluck the requested registers from the pushed sequence
+            temp_regs = platform.get_temp_regs_for_tco(elements_to_keep)
+            for i in range(elements_to_keep):
+                # Index 0 is mathematically the "bottom" register (the one pushed first)
+                offset_from_top = pushed_base_bytes - ((start_idx + i) * platform.REGISTER_SIZE)
+                platform.read_local(temp_regs[i], -offset_from_top)
+                
+            # 4. Obliterate the old flat sequence entirely to prevent leaks
+            platform.shrink_stack(pushed_base_bytes)
+            self.current_stack_depth -= pushed_base_bytes
+            
+            # 5. Push ONLY the exact requested isolated slices back onto the active stack tip
+            for i in range(elements_to_keep):
+                platform.push(temp_regs[i])
+                self.current_stack_depth += platform.REGISTER_SIZE
+
+            assert self.current_stack_depth == initial_depth + (elements_to_keep * platform.REGISTER_SIZE), "Lens sequence physically failed strict layout reversion boundaries"
     def Assignment(self, node):
         assert node.node_type == NodeType.Assignment, "Operator node routing misaligned completely bypassing strict framework typing"
         assert node.left is not None and node.right is not None, "Algebraic bounds stricture requires execution mapping fully on both adjacent sequence sides"
@@ -689,8 +723,8 @@ class Compiler:
         if self.pure_context_out_var is not None:
             if node.left.node_type == NodeType.Identifier:
                 assert node.left.value == self.pure_context_out_var, f"Visible Mutation Guarantee Violation at {node.line}:{node.col} -> Pure macro absolutely cannot arbitrarily mutate external binding '{node.left.value}'"
-            elif node.left.node_type == NodeType.Deref:
-                raise SyntaxError(f"Visible Mutation Guarantee Violation at {node.line}:{node.col} -> Pure macro contexts are definitively barred from corrupting unknown memory space via blind Deref assignment logic")
+            elif node.left.node_type == NodeType.Lens and node.left.left is None:
+                raise SyntaxError(f"Visible Mutation Guarantee Violation at {node.line}:{node.col} -> Pure macro contexts are definitively barred from corrupting unknown memory space via blind Lens assignment logic")
 
         initial_depth = self.current_stack_depth
 
@@ -726,24 +760,21 @@ class Compiler:
                 
                 offset = sym.offset_from_base - self.current_stack_depth
                 
-                assert offset <= -platform.REGISTER_SIZE, f"Assignment layout error: Offset {offset} for '{name}' targets unallocated SP tip (0). Overwrite must physically target negative populated space."
-                assert offset <= 0, f"CRITICAL: Assignment logic mapped overwrite target mathematically shifting into upper memory unallocated '{name}' footprint boundaries!"
-                assert offset % platform.REGISTER_SIZE == 0, "Assignment target physically misaligned entirely mapping local memory stores"
-                
+                self.validate_and_get_offset(sym.offset_from_base, node.value, negative=True)
                 platform.write_local(offset, platform.t0)
             else:
                 self.declare_symbol(name)
 
-        elif node.left.node_type == NodeType.Deref:
+        elif node.left.node_type == NodeType.Lens and node.left.left is None:
             self.current_assignment_lhs = None
-            self._compile_node(node.left.left)
+            self._compile_node(node.left.right)
             
             assert self.current_stack_depth == initial_depth + platform.REGISTER_SIZE, "Target memory layout array access definitively failed producing valid strictly singular base address"
             
             self.current_assignment_lhs = node.left
             self._compile_node(node.right)
             
-            assert self.current_stack_depth == initial_depth + 2 * platform.REGISTER_SIZE, "Deref memory calculation misaligned stack requirement executing base load and RHS payload bounds"
+            assert self.current_stack_depth == initial_depth + 2 * platform.REGISTER_SIZE, "Lens memory calculation misaligned stack requirement executing base load and RHS payload bounds"
             
             platform.pop(platform.t0)
             self.current_stack_depth -= platform.REGISTER_SIZE
@@ -775,9 +806,7 @@ class Compiler:
                     if sym:
                         offset = sym.offset_from_base - self.current_stack_depth
                         
-                        assert offset <= -platform.REGISTER_SIZE, f"Tuple split layout error: Writeback offset {offset} for '{target_name}' targets unallocated SP tip instead of its logically allocated frame slot."
-                        assert offset <= 0, f"Local array split assignment bounds structurally point backwards towards positive unallocated offset depth {offset}"
-                        assert offset % platform.REGISTER_SIZE == 0, "Tuple assignment extraction misaligned strictly executing local memory boundaries"
+                        self.validate_and_get_offset(sym.offset_from_base, node.value, negative=True)
                         
                         platform.write_local(offset, safe_regs[i])
                     else:
@@ -785,14 +814,14 @@ class Compiler:
                         self.current_stack_depth += platform.REGISTER_SIZE
                         self.declare_symbol(target_name)
                         
-                elif target.node_type == NodeType.Deref:
+                elif target.node_type == NodeType.Lens and target.left is None:
                     for r in range(num_targets):
                         platform.push(safe_regs[r])
                         self.current_stack_depth += platform.REGISTER_SIZE
                     
                     depth_before_ptr = self.current_stack_depth
                     self.current_assignment_lhs = None
-                    self._compile_node(target.left)
+                    self._compile_node(target.right)
                     
                     assert self.current_stack_depth == depth_before_ptr + platform.REGISTER_SIZE, "Evaluation of unpack pointer explicitly corrupted executing scope tracking parameters"
                     self.current_assignment_lhs = node.left
@@ -810,7 +839,6 @@ class Compiler:
             
         self.current_assignment_lhs = old_lhs
         assert self.current_stack_depth >= initial_depth, "Assignment hardware logic sequence executed impossible stack loss shrinking original boundary baseline frame parameters"
-
     def MacroCall(self, node):
         assert node.node_type == NodeType.MacroCall, "Runtime bounds sequence bypassed correctly mapped instruction tree"
         assert isinstance(node.value, str) and node.value, "Macro implementation mandates strict assignment naming sequence parameters"
@@ -850,10 +878,7 @@ class Compiler:
 
         offset = out_sym.offset_from_base - self.current_stack_depth
         
-        assert offset <= -platform.REGISTER_SIZE, f"Macro call layout error: Output offset {offset} targets the unallocated SP tip (0). Values safely live strictly negative relative to SP."
-        assert offset <= 0, "Macro alignment layout parameters mandate absolute negative hardware boundaries returning locally scoped outputs mapped underneath execution limits"
-        assert offset % platform.REGISTER_SIZE == 0, "Macro out parameter layout offset completely misaligned entirely breaking hardware memory limits"
-        
+        self.validate_and_get_offset(out_sym.offset_from_base, node.value, negative=True)
         platform.read_local(platform.t0, offset)
         self.exit_scope()
         self.macro_expansion_stack.pop()
@@ -920,20 +945,7 @@ class Compiler:
             self.pure_context_history.append(saved_history_val)
             
         self.pure_context_out_var = saved_pure
-        
-    def _ast_nodes_equal(self, n1, n2):
-        if n1 is None and n2 is None: return True
-        if n1 is None or n2 is None: return False
-        assert hasattr(n1, 'node_type') and hasattr(n2, 'node_type'), "Structural map comparisons must strictly exclusively analyze identical AST framework nodes"
-        
-        if n1.node_type != n2.node_type: return False
-        if n1.value != n2.value: return False
-        if len(n1.children) != len(n2.children): return False
-        for c1, c2 in zip(n1.children, n2.children):
-            if not self._ast_nodes_equal(c1, c2): return False
-        if not self._ast_nodes_equal(n1.left, n2.left): return False
-        if not self._ast_nodes_equal(n1.right, n2.right): return False
-        return True
+      
 
     def Program(self, node):
         assert node.node_type == NodeType.Program, "Program execution strict parameter mapping demands immediate top level boundary configuration nodes entirely mapping entry execution blocks"
@@ -1112,10 +1124,7 @@ class Compiler:
         if store_back_sym:
             offset = store_back_sym.offset_from_base - self.current_stack_depth
             
-            assert offset <= -platform.REGISTER_SIZE, f"ASM layout error: Output offset {offset} explicitly points to unallocated stack top (0) instead of overwriting a populated local frame variable"
-            assert offset <= 0, "ASM limits physically prohibit overwriting stack mappings indexing forward entirely corrupting map state parameters targeting strictly negative execution bounds fully allocating variables strictly mapping layout limits exactly allocating bounds entirely"
-            assert offset % platform.REGISTER_SIZE == 0, "ASM output mapping offset completely misaligned structurally bypassing mapped targets entirely"
-            
+            self.validate_and_get_offset(store_back_sym.offset_from_base, node.value, negative= True)
             platform.write_local(offset, platform.t0)
             
             if self.pure_context_out_var and output_name == self.pure_context_out_var:
@@ -1143,21 +1152,3 @@ class Compiler:
         
         platform.push_value(node.value)
         self.current_stack_depth += platform.REGISTER_SIZE
-
-    def Deref(self, node):
-        assert node.node_type == NodeType.Deref, "Pointer map indirection physically requires fully mapped execution parameters matching strictly target node layout types precisely configuring bounds exclusively bounding mappings"
-        assert node.left is not None, "Pointer evaluation stack footprint mathematically mandates target parameter bindings explicitly mapping execution states executing boundaries continuously configuring map logic fully"
-        
-        initial_depth = self.current_stack_depth
-        self._compile_node(node.left)
-        
-        assert self.current_stack_depth == initial_depth + platform.REGISTER_SIZE, "Execution pointer logic mathematically failed pushing exactly one completely verified address bounds physically establishing memory boundary sequence footprint purely"
-        
-        platform.pop(platform.t0) 
-        self.current_stack_depth -= platform.REGISTER_SIZE
-        
-        platform.load_deref(platform.t1, platform.t0)
-        platform.push(platform.t1)
-        self.current_stack_depth += platform.REGISTER_SIZE
-        
-        assert self.current_stack_depth == initial_depth + platform.REGISTER_SIZE, "Target memory layout sequence completely damaged execution stack array limits physically rendering exactly valid mapped offset parameters strictly establishing correct frame physics completely unconditionally mapping bounds executing completely unconditionally"

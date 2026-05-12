@@ -15,12 +15,11 @@ class NodeType(Enum):
     Value = auto()
     Intrinsic = auto()      
     MacroDef = auto()       
-    MacroCall = auto()      
-    Deref = auto()    
+    MacroCall = auto()  
     Call = auto()            
     FunctionDef = auto()    
     CallerContext = auto()  
-    Slice = auto()           
+    Lens = auto()               
 
 @dataclass
 class ASTNode:
@@ -161,13 +160,13 @@ class Parser:
         if self is None:
             return True
         if self.node_type == NodeType.Assignment:
-            if self.left.node_type == NodeType.Deref:
+            if self.left.node_type == NodeType.Lens and self.left.left is None:
                 return False
             # assignment to normal variable is pure (updates local scope)
         if self.node_type == NodeType.Intrinsic and self.value == "asm":
             # check for store/sw/sb instructions
             inst = self.children[0].value
-            if inst in ("store", "sw", "sb"):
+            if inst in ("store", "sw", "sb"): #TODO: grab from platform. or delay till compiler. whole thing should be moved to compiler probably.
                 return False
         # check children
         for child in (self.left, self.right):
@@ -310,9 +309,9 @@ class Parser:
 
             if t.value == '[':
                 expr = self.parse_expr()
-                assert expr is not None, "Deref requires a valid expression inside brackets"
+                assert expr is not None, "Lens requires a valid expression inside brackets"
                 self.match(']')
-                return ASTNode(NodeType.Deref, left=expr, line=t.line, col=t.col)
+                return ASTNode(NodeType.Lens, left=None, right=expr, line=t.line, col=t.col)
                 
             if t.value == '.':
                 next_t = self.consume()
@@ -339,7 +338,7 @@ class Parser:
                     return self.parse_asm_intrinsic(t)
                 elif next_t.value in ('import', 'embed', 'using'):
                     self.match('(')
-                    path_tokens = []
+                    path_tokens =[]
                     while self.peek() and not getattr(self.peek(), 'value', None) == ')':
                         path_tokens.append(str(getattr(self.consume(), 'value', '')))
                     self.match(')')
@@ -381,7 +380,6 @@ class Parser:
 
         raise SyntaxError(f"Unexpected token {t} at line {t.line}:{t.col}")
     
-    
     def led(self, left, t, prec):
         assert left is not None and isinstance(left, ASTNode), "led() requires a valid left ASTNode"
         assert t is not None, "led() called with None token"
@@ -418,7 +416,7 @@ class Parser:
                     is_slice = True
 
                 if is_slice:
-                    return ASTNode(NodeType.Slice, left=left, children=[inner_expr], line=t.line, col=t.col)
+                    return ASTNode(NodeType.Lens, left=left, right=inner_expr, line=t.line, col=t.col)
 
                 type_name = build_type_name(inner_expr)
                 assert type_name, "Failed to resolve type name from annotation"
@@ -438,7 +436,7 @@ class Parser:
                 
                 if left.node_type == NodeType.Pipeline and \
                    left.left.node_type == NodeType.Identifier and \
-                   left.right.node_type in (NodeType.Identifier, NodeType.Tuple, NodeType.Deref):
+                   left.right.node_type in (NodeType.Identifier, NodeType.Tuple, NodeType.Lens):
                     is_func = True
                     func_name = left.left.value
                     ret_node = left.right
@@ -497,7 +495,6 @@ class Parser:
                     return self.expand_macro(valid_rules, t, left)
 
         raise SyntaxError(f"Unexpected infix operator {t} at line {t.line}:{t.col}")
-
     def expand_macro(self, rule_list, token, left):
         assert rule_list, "expand_macro called with an empty rule_list"
         assert token is not None, "expand_macro requires a valid trigger token"
