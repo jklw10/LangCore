@@ -67,5 +67,5 @@ foo : res[int] = (x, 2) : { res = x + 10 };
 foo : res[int] = (x, y) : { res = 99 };
 
 [65000] = foo(1, 2); // Will be 10
-[65000] = foo(2, 2); // Will be 20
+[65000] = foo(2, 2); // Will be 12
 [65000] = foo(5, 5); // Will be 99

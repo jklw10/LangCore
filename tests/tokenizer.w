@@ -27,7 +27,7 @@ parse_loop : _ = (0, ptr[int], max_ptr[int]) : {
     is_space = char == 32;
     is_newline = char == 10;
     
-    // Negative Space constraint: we assert char is within ASCII bounds
+    // we assert char is within ASCII bounds
     assert(char < 128);
 
     if (is_space) {

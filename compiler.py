@@ -167,13 +167,15 @@ class Compiler:
     
     def validate_and_get_offset(self, target_offset_from_base, name: str, negative = False) -> int:
         offset = target_offset_from_base - self.current_stack_depth
-        assert offset <= -platform.REGISTER_SIZE, f"Memory read error: Calculated offset {offset} for '{name}' reads the unallocated stack tip."
+        
+        # New Strict Validation logic to catch the drift
         if negative:
-            assert offset <= 0, f"CRITICAL: Assignment logic mapped overwrite target mathematically shifting into upper memory unallocated '{name}' footprint boundaries!"
-            assert offset <= 0, f"CRITICAL BUG: Memory offset {offset} for '{name}' is positive. Stack physics mandate reading old variables at negative offsets below the upward-growing SP!"
-            assert offset <= 0, f"Hardware layout error: Parameter '{name}' must occupy a non-positive base offset reflecting the caller's stack frame"
-
+            assert offset <= -platform.REGISTER_SIZE, f"Memory read error: Calculated offset {offset} for '{name}' targets the unallocated stack tip or above."
+        else:
+            assert offset < 0, f"Memory offset constraint failed: Calculated relative offset {offset} pushes purely into positive disjoint bounds for '{name}'."
+            
         assert offset % platform.REGISTER_SIZE == 0, f"Hardware offset memory fetch definitively broke structural alignment bounds: {offset}"
+
         return offset
 
     def _register_functions(self, node: ASTNode, current_type_context=None):
@@ -301,12 +303,14 @@ class Compiler:
         
         info = SymbolInfo(offset_from_base=self.current_stack_depth - platform.REGISTER_SIZE)
         
+        assert info.offset_from_base >= 0, f"Symbol offset {info.offset_from_base} mathematically violates minimum positive stack space."
         assert info.offset_from_base <= self.current_stack_depth - platform.REGISTER_SIZE, f"Symbol declaration error: Recorded absolute offset {info.offset_from_base} identically points to the current empty SP tip, not the physically populated slot beneath it."
         assert info.offset_from_base % platform.REGISTER_SIZE == 0, f"Hardware violation: Local variable offset {info.offset_from_base} misaligned to the {platform.REGISTER_SIZE} byte boundaries"
         
         self.scopes[-1][name] = info
         assert self.scopes[-1][name] is info, "Symbol mapping strictly failed to bind new layout info to active scope map structure"
         return info
+
 
     def Identifier(self, node):
         assert node.node_type == NodeType.Identifier, "Node routed to Identifier phase strictly requires matching internal typing"
@@ -320,7 +324,6 @@ class Compiler:
         if hasattr(self, 'static_fields') and name in self.static_fields:
             val = self.static_fields[name]
             if isinstance(val, str):
-                # Strings inherently behave as explicit static @embed blocks
                 data = val.encode('utf-8')
                 skip_label = self.get_unique_label("skip_str")
                 platform.jump_and_link(platform.t0, skip_label)
@@ -332,10 +335,8 @@ class Compiler:
                     
                 platform.label(skip_label)
                 
-                # Push the absolute memory pointer
                 platform.push(platform.t0)
                 self.current_stack_depth += platform.REGISTER_SIZE
-                # Push the physical byte length
                 platform.push_value(len(data))
                 self.current_stack_depth += platform.REGISTER_SIZE
             else:
@@ -354,8 +355,10 @@ class Compiler:
             
         offset = sym.offset_from_base - self.current_stack_depth
         
+        # Explicit sanity check ensuring variable wasn't structurally discarded before retrieval
+        assert sym.offset_from_base <= self.current_stack_depth - platform.REGISTER_SIZE, f"Variable '{node.value}' destruction detected: Recorded base offset {sym.offset_from_base} resides above the current tracking stack pointer bounds."
+        
         self.validate_and_get_offset(sym.offset_from_base, node.value, negative=True)
-        #questionable magic value. define in platform.
         assert abs(offset) < (15 * platform.REGISTER_SIZE), f"Memory offset {offset} for '{node.value}' exceeds all logical bounds of the caller frame map footprint."
         
         platform.read_local(platform.t0, offset) 
@@ -496,6 +499,7 @@ class Compiler:
         
         platform.label(skip_label)
         assert self.current_stack_depth == old_stack_depth, "Parent scope map fatally injured compiling dynamic child layout definition footprint"
+    
     def Call(self, node):
         assert node.node_type == NodeType.Call, "Node operation request branch incorrectly evaluates logic map"
         assert isinstance(node.value, str) and node.value, "Invocation mechanism maps entirely blank execution bounds"
@@ -507,8 +511,8 @@ class Compiler:
         if func_name.startswith(".") and getattr(self, 'current_type_context', None):
             func_name = self.current_type_context + func_name
             
-        defs = self.function_registry.get(func_name,[])
-        defs =[d for d in defs if len(d['pat_args']) == len(call_args)]
+        defs = self.function_registry.get(func_name, [])
+        defs = [d for d in defs if len(d['pat_args']) == len(call_args)]
         
         if not defs:
             raise ValueError(f"No matching overloaded signature configuration found for branch '{func_name}' mapping {len(call_args)} distinct args at line {node.line}:{node.col}")
@@ -584,10 +588,12 @@ class Compiler:
                     platform.pop(reg)
                     self.current_stack_depth -= platform.REGISTER_SIZE
                 
-                assert self.current_stack_depth == saved_depth - expected_arg_bytes, "Stack unwind alignment mathematically missed layout requirement bounds post-TCO argument pop"
+                assert self.current_stack_depth == saved_depth - expected_arg_bytes, f"Stack unwind alignment mathematically missed layout requirement bounds post-TCO argument pop. Expected {saved_depth - expected_arg_bytes}, got {self.current_stack_depth}."
                 
-                for i, reg in enumerate(reversed(temp_regs)):
-                    target_offset_from_base = -platform.REGISTER_SIZE * (i + 1)
+                num_args = len(temp_regs)
+                for i, reg in enumerate(temp_regs):
+                    # Mathematical inversion linking target parameter array placement directly to frame bounds
+                    target_offset_from_base = -platform.REGISTER_SIZE * (num_args - i)
                     
                     offset = target_offset_from_base - self.current_stack_depth
                     self.validate_and_get_offset(target_offset_from_base, node.value)
@@ -595,7 +601,8 @@ class Compiler:
                     platform.write_local(offset, reg)
                     
                 diff = self.current_stack_depth - getattr(self, 'loop_base_depth', platform.REGISTER_SIZE)
-                assert diff >= 0, "TCO parameter evaluation base overlap failed runtime logic geometry constraint"
+                assert diff >= 0, f"TCO parameter evaluation base overlap failed runtime logic geometry constraint! Diff calculation returned negative: {diff}"
+                assert diff % platform.REGISTER_SIZE == 0, f"Tail recursion shrink constraint misaligned completely against register sizes: {diff}"
                 
                 if diff > 0:
                     platform.shrink_stack(diff)
@@ -633,7 +640,7 @@ class Compiler:
                 platform.shrink_stack(num_args * platform.REGISTER_SIZE)
                 self.current_stack_depth -= (num_args * platform.REGISTER_SIZE)
             
-            assert self.current_stack_depth == initial_depth, "Call framework strictly mandates stack pointer reversion fully prior to output integration execution"
+            assert self.current_stack_depth == initial_depth, f"Call framework strictly mandates stack pointer reversion fully prior to output integration execution. Failed bounds {self.current_stack_depth} != {initial_depth}"
             
             if num_returns > 0:
                 for i in range(num_returns):
@@ -712,6 +719,9 @@ class Compiler:
                 self.current_stack_depth += platform.REGISTER_SIZE
 
             assert self.current_stack_depth == initial_depth + (elements_to_keep * platform.REGISTER_SIZE), "Lens sequence physically failed strict layout reversion boundaries"
+
+
+
     def Assignment(self, node):
         assert node.node_type == NodeType.Assignment, "Operator node routing misaligned completely bypassing strict framework typing"
         assert node.left is not None and node.right is not None, "Algebraic bounds stricture requires execution mapping fully on both adjacent sequence sides"
@@ -755,12 +765,14 @@ class Compiler:
             
             sym = self.get_symbol(name)
             if sym:
+                assert sym.offset_from_base <= self.current_stack_depth - platform.REGISTER_SIZE, f"Attempting to overwrite destroyed or invalid variable '{name}' offset location {sym.offset_from_base}"
+                
                 platform.pop(platform.t0)
                 self.current_stack_depth -= platform.REGISTER_SIZE
                 
                 offset = sym.offset_from_base - self.current_stack_depth
-                
                 self.validate_and_get_offset(sym.offset_from_base, node.value, negative=True)
+                assert offset < 0, f"Assignment overwrite memory offset constraint failure: {offset} is not natively pointing backwards down the footprint tree!"
                 platform.write_local(offset, platform.t0)
             else:
                 self.declare_symbol(name)
@@ -804,10 +816,9 @@ class Compiler:
                         
                     sym = self.get_symbol(target_name)
                     if sym:
+                        assert sym.offset_from_base <= self.current_stack_depth, f"Tuple assignment targeting destroyed scope binding {target_name}"
                         offset = sym.offset_from_base - self.current_stack_depth
-                        
                         self.validate_and_get_offset(sym.offset_from_base, node.value, negative=True)
-                        
                         platform.write_local(offset, safe_regs[i])
                     else:
                         platform.push(safe_regs[i])
@@ -838,7 +849,8 @@ class Compiler:
             raise SyntaxError(f"Syntax logic check failed unconditionally at line {node.line}:{node.col} -> Mapping execution target mapped unsupported assignment AST bounds {node.left.node_type.name}")
             
         self.current_assignment_lhs = old_lhs
-        assert self.current_stack_depth >= initial_depth, "Assignment hardware logic sequence executed impossible stack loss shrinking original boundary baseline frame parameters"
+        assert self.current_stack_depth >= initial_depth, f"Assignment hardware logic sequence executed impossible stack loss shrinking original boundary baseline frame parameters. End depth: {self.current_stack_depth}"
+
     def MacroCall(self, node):
         assert node.node_type == NodeType.MacroCall, "Runtime bounds sequence bypassed correctly mapped instruction tree"
         assert isinstance(node.value, str) and node.value, "Macro implementation mandates strict assignment naming sequence parameters"
@@ -862,12 +874,19 @@ class Compiler:
         self.current_stack_depth += platform.REGISTER_SIZE
         out_sym = self.declare_symbol(node.value)
         
-        assert out_sym.offset_from_base == start_depth, "Macro evaluation hardware bounds definitively broke strict return symbol alignment initialization offset mapping parameters"
-        
         old_lhs = getattr(self, 'current_assignment_lhs', None)
         self.current_assignment_lhs = None
         
+        old_branch_flag = getattr(self, 'macro_branch_emitted', False)
+        self.macro_branch_emitted = False
+        
         self._compile_node(node.left)
+        
+        body_diff = self.current_stack_depth - (start_depth + platform.REGISTER_SIZE)
+        if self.macro_branch_emitted:
+            assert body_diff == 0, f"Control flow alignment error: Macro '{node.value}' contains internal branches but resulted in a net stack change of {body_diff} bytes. Conditional execution of stack-modifying instructions (like raw hardware output pushes or new variable declarations) will fatally desynchronize the runtime stack pointer if the block branches, causing severe memory corruption and infinite loops."
+            
+        self.macro_branch_emitted = old_branch_flag or self.macro_branch_emitted
         
         assert self.current_stack_depth >= start_depth + platform.REGISTER_SIZE, "Inline macro tree instruction completely discarded executing local parameter initialization scope boundary"
         
@@ -891,40 +910,11 @@ class Compiler:
             self.current_stack_depth = start_depth
 
         platform.push(platform.t0)
-        self.current_stack_depth += platform.REGISTER_SIZE
+        self.current_stack_depth = start_depth + platform.REGISTER_SIZE
         
         assert self.current_stack_depth == start_depth + platform.REGISTER_SIZE, "Macro block mapping logic critically bypassed safe execution returning completely misaligned physical bounds"
-
-    def Block(self, node):
-        assert node.node_type == NodeType.Block, "Block instruction routing mismatched strictly required internal AST identification parameters"
-        
-        self.enter_scope()
-        start_depth = self.current_stack_depth
-        
-        old_lhs = getattr(self, 'current_assignment_lhs', None)
-        
-        for i, child in enumerate(node.children):
-            if i < len(node.children) - 1:
-                self.current_assignment_lhs = None
-            else:
-                self.current_assignment_lhs = old_lhs
-                
-            self._compile_node(child)
-            
-        self.current_assignment_lhs = old_lhs
-        
-        diff = self.current_stack_depth - start_depth
-        assert diff >= 0, f"Block scope mapping physically damaged local runtime hardware bounds returning negative differential sequence map bytes {diff}"
-        
-        if diff > 0:
-            platform.shrink_stack(diff)
-            self.current_stack_depth = start_depth
-            
-        self.exit_scope()
-        
-        assert self.current_stack_depth == start_depth, "Block bounds fundamentally executed breaking stack layout requirements targeting exact baseline parameters fully mapping layouts"
-
-
+    
+    
     def CallerContext(self, node):
         assert node is not None and node.node_type == NodeType.CallerContext, "Execution boundaries mandate strict type parameter mappings exclusively utilizing target node classes"
         assert hasattr(node, 'left'), "Caller logic context strictly demands valid singular left sequence mapping argument"
@@ -946,6 +936,54 @@ class Compiler:
             
         self.pure_context_out_var = saved_pure
       
+    def _compile_statement_sequence(self, children):
+        
+        start_depth = self.current_stack_depth
+        old_lhs = getattr(self, 'current_assignment_lhs', None)
+        
+        for i, child in enumerate(children):
+            if i < len(children) - 1:
+                self.current_assignment_lhs = None
+            else:
+                self.current_assignment_lhs = old_lhs
+                
+            depth_before = self.current_stack_depth
+            scope_size_before = len(self.scopes[-1])
+            
+            self._compile_node(child)
+            
+            # Identify unbound bytes leaked by expression statements
+            diff = self.current_stack_depth - depth_before
+            expected_growth = (len(self.scopes[-1]) - scope_size_before) * platform.REGISTER_SIZE
+            unbound_bytes = diff - expected_growth
+            
+            assert unbound_bytes >= 0, "Statement evaluation fundamentally corrupted stack layout, returning a negative differential."
+            assert unbound_bytes % platform.REGISTER_SIZE == 0, "Unbound leaked bytes misaligned to strict register parameters."
+            
+            if unbound_bytes > 0:
+                # Dynamically drop unbound expression leaks from the executing stack runtime
+                platform.shrink_stack(unbound_bytes)
+                self.current_stack_depth -= unbound_bytes
+                
+        self.current_assignment_lhs = old_lhs
+        
+        diff = self.current_stack_depth - start_depth
+        assert diff >= 0, f"Block scope mapping physically damaged local runtime hardware bounds returning negative differential sequence map bytes {diff}"
+        
+        if diff > 0:
+            platform.shrink_stack(diff)
+            self.current_stack_depth = start_depth
+
+    def Block(self, node):
+        assert node.node_type == NodeType.Block, "Block instruction routing mismatched strictly required internal AST identification parameters"
+        
+        start_depth = self.current_stack_depth
+        self.enter_scope()
+        self._compile_statement_sequence(node.children)
+    
+        self.exit_scope()
+        
+        assert self.current_stack_depth == start_depth, "Block bounds fundamentally executed breaking stack layout requirements targeting exact baseline parameters fully mapping layouts"
 
     def Program(self, node):
         assert node.node_type == NodeType.Program, "Program execution strict parameter mapping demands immediate top level boundary configuration nodes entirely mapping entry execution blocks"
@@ -954,19 +992,11 @@ class Compiler:
         old_ctx = getattr(self, 'current_type_context', None)
         self.current_type_context = "main"
         
-        start_depth = self.current_stack_depth
-        for child in node.children:
-            self._compile_node(child)
-            
-        diff = self.current_stack_depth - start_depth
-        assert diff >= 0, "Top level program layout corrupted stack boundaries falling below absolute zero baseline"
-        if diff > 0:
-            platform.shrink_stack(diff)
-            self.current_stack_depth = start_depth
+        self._compile_statement_sequence(node.children)
             
         self.current_type_context = old_ctx
         platform.halt()
-
+    
     def MacroDef(self, node):
         assert node.node_type == NodeType.MacroDef, "Macro execution parameter block structure boundaries physically overwritten bypassing logic maps"
 
@@ -1041,6 +1071,8 @@ class Compiler:
         
         for i, arg in enumerate(node.children[1:]):
             if platform.is_branch_target(inst_name, i, len(node.children[1:])):
+                # Flag to the upstream macro evaluator that raw control flow logic is happening
+                self.macro_branch_emitted = True 
                 val = arg.value if hasattr(arg, 'value') else arg
                 assert isinstance(val, (str, int)), f"Branch jump targets physically mandate resolution maps against strings or offsets, breaching mapping logic with '{val}'"
                 
@@ -1095,9 +1127,16 @@ class Compiler:
             else:
                 eval_args.append({'type': 'eval', 'node': arg})
 
-        eval_nodes =[e for e in eval_args if e['type'] == 'eval']
+        eval_nodes = [e for e in eval_args if e['type'] == 'eval']
+        
+        pre_eval_depth = self.current_stack_depth
+
         for e in eval_nodes:
+            depth_before_node = self.current_stack_depth
             self._compile_node(e['node'])
+            assert self.current_stack_depth == depth_before_node + platform.REGISTER_SIZE, f"Inline argument evaluation failed to consistently push exactly 1 parameter layout item, delta: {self.current_stack_depth - depth_before_node}"
+
+        assert self.current_stack_depth == pre_eval_depth + (len(eval_nodes) * platform.REGISTER_SIZE), "Total ASM node evaluation completely desynced expected push count baseline."
             
         for e in reversed(eval_nodes):
             tmp_reg = temp_pool[temp_idx]
@@ -1105,6 +1144,8 @@ class Compiler:
             platform.pop(tmp_reg)
             self.current_stack_depth -= platform.REGISTER_SIZE
             e['reg'] = tmp_reg
+            
+        assert self.current_stack_depth == pre_eval_depth, "Hardware sequence mapping completely failed to pop identical evaluation operands! Stack memory permanently leaking variables."
             
         for e in eval_args:
             if e['type'] == 'eval':
@@ -1123,21 +1164,17 @@ class Compiler:
         
         if store_back_sym:
             offset = store_back_sym.offset_from_base - self.current_stack_depth
-            
-            self.validate_and_get_offset(store_back_sym.offset_from_base, node.value, negative= True)
+            self.validate_and_get_offset(store_back_sym.offset_from_base, node.value, negative=True)
             platform.write_local(offset, platform.t0)
             
             if self.pure_context_out_var and output_name == self.pure_context_out_var:
                 assert self.current_stack_depth >= 0, "Inline asm bounds execution definitively breached zero stack baseline entirely skipping parameter configurations unconditionally"
                 return
 
-        if has_rd:
-            platform.push(rd_reg_to_push)
-            self.current_stack_depth += platform.REGISTER_SIZE
-        else:
+        if not has_rd:
             assert rd_reg_to_push == 0, "Execution logically bounded structural limits explicitly restricting returning payload blocks bypassing safe branch mappings unconditionally"
             assert platform.is_volatile_instruction(inst_name), "Volatile bypass safety assertion caught invalid instruction escaping RD bounds requirement"
-            
+
     def Tuple(self, node):
         assert node.node_type == NodeType.Tuple, "Execution parameter sequence requires physically standard map logic directly translating entirely targeting tuple sequences exactly"
         for child in node.children:

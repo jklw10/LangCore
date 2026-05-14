@@ -1,9 +1,9 @@
 If there's a decision to be made ask, if there's a discrepancy between docs and code or discussion, point it out.
 I'm not using any coding tools, so just output the functions that were changed.
 
-negative space programming, aka asserts everywhere:
-no trivial asserts like assert true or assert out on a value you just assigned.
-assert on values that aren't immediately obvious from the nearby code context what they should be.
+asserts everywhere:
+    no trivial asserts like "assert true" or assert on a value you just assigned.
+    assert on values that aren't immediately obvious from the nearby code context what they should be.
 
 during debugging:
     if i get assembly output:
@@ -14,9 +14,29 @@ during debugging:
 
 current task:
 
-simplification of code
+tokenizer.w is skipping past it's last ecall or looping endlessly
 
-std.w:
+asdasdasd
+
+
+
+->
+Execution finished in 427 cycles.
+Final SP (x2): 0x00008028
+Final a0 (x10): 2
+
+if you feed in just 2 letters it runs in 200 ish cycles and is fine. something in the loop is breaking. 
+
+a
+
+->
+Execution finished in 630 cycles.
+Final SP (x2): 0x0000802c
+Final a0 (x10): 3
+
+your analysis:
+
+
 
 
 bool : value[bool] = (byte[0:1]):{
@@ -79,7 +99,6 @@ int : value[int] = (bytes[0:4]):{
         value = 4; //decided by fair dice
     };
 };
-//does this need a shorthand?:
 sys : value[int] = (bytes[0:0]): {
     .read_stdin : bytes_read[int] = (dest_ptr[int], max_len[int]) : {
         @asm(addi, x17, zero, 3); // Syscall 3: Read
@@ -147,7 +166,7 @@ parse_loop : _ = (0, ptr[int], max_ptr[int]) : {
     is_space = char == 32;
     is_newline = char == 10;
     
-    // Negative Space constraint: we assert char is within ASCII bounds
+    // assert char is within ASCII bounds
     assert(char < 128);
 
     if (is_space) {
