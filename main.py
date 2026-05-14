@@ -72,7 +72,7 @@ def run_program(lib, RiscVState, filepath):
     cycles = 0
     cpu_state.memory[65000] = 255 
 
-    while not cpu_state.halt and cycles < 100000:
+    while not cpu_state.halt and cycles < 1000000:
         lib.run_cycles(ctypes.byref(cpu_state), 1)
         cycles += 1
         

@@ -75,9 +75,15 @@ class ComptimeFolder:
         return val
 
     def has_only_static_caller_contexts(self, n):
-        if not n: return True
-        if n.node_type == NodeType.CallerContext:
-            return getattr(n.left, 'node_type', None) == NodeType.Value
+        if not n: 
+            return True
+        
+        # If it's a hygiene-substituted node, it must resolve to a raw Value
+        if getattr(n, 'caller_context_depth', 0) > 0:
+            if n.node_type != NodeType.Value: 
+                return False
+            return True # Values have no children, so we can exit safely
+            
         for c in getattr(n, 'children', []): 
             if not self.has_only_static_caller_contexts(c): return False
         if getattr(n, 'left', None) and not self.has_only_static_caller_contexts(n.left): return False
@@ -138,7 +144,7 @@ class Workspace:
         self.discover_file(main_filepath)
         full_ast = self.semantic_parse_file(main_filepath)
         
-        assert full_ast.node_type == NodeType.Program, "Compilation structural entry point must be a Program node"
+        assert full_ast.node_type == NodeType.Block, "Compilation structural entry point must be a Block node"
         
         # JIT COMPTIME FOLD PASS
         if self.cpu_lib and self.cpu_state_type:
@@ -227,7 +233,7 @@ class Workspace:
         assert ast_full is not None, "Semantic parser failed to construct a final AST framework"
         self._inline_imports(ast_full)
         
-        assert ast_full.node_type == NodeType.Program, "Semantic parse routine must definitively yield a Program root node"
+        assert ast_full.node_type == NodeType.Block, "Semantic parse routine must definitively yield a Block root node"
         return ast_full
 
     def _inline_imports(self, node):
@@ -286,11 +292,33 @@ class Compiler:
     def compile(self, node: ASTNode):
         platform.init()
         self._register_functions(node)
-        self._compile_node(node)
+        old_ctx = getattr(self, 'current_type_context', None)
+        self.current_type_context = "main"
         
+        platform.emit_instruction("addi", platform.get_register("fp"), platform.get_register("sp"), 0)
+        
+        platform.start_scope()
+        #self._compile_node(node)
+        self._compile_statement_sequence(node.children)
+        platform.end_scope(returns=0)
+        
+        platform.halt()
         assert len(self.scopes) == 1, f"Compiler execution leaked {len(self.scopes) - 1} un-exited scope layers upon finish"
         return platform
     
+    def Block(self, node):
+        start_fp_offset = getattr(self, 'local_fp_offset', 0)
+        
+        platform.start_scope()
+        self.enter_scope()
+        
+        self._compile_statement_sequence(node.children)
+        
+        self.exit_scope()
+        platform.end_scope(returns=0)
+
+        self.local_fp_offset = start_fp_offset
+
     def _register_functions(self, node: ASTNode, current_type_context=None):
         if not node: 
             return
@@ -363,9 +391,28 @@ class Compiler:
     def _compile_node(self, node: ASTNode):
         if not node: 
             return
+            
+        depth = getattr(node, 'caller_context_depth', 0)
+        popped_states = []
+        
+        # Winding Down (Restoring Caller context)
+        if depth > 0:
+            for _ in range(depth):
+                if self.pure_context_history:
+                    popped_states.append(self.pure_context_out_var)
+                    self.pure_context_out_var = self.pure_context_history.pop()
+
         method_name = node.node_type.name
         visitor = getattr(self, method_name, self.error)
-        return visitor(node)
+        result = visitor(node)
+
+        # Winding Up (Restoring Macro context)
+        if depth > 0:
+            for saved_out_var in reversed(popped_states):
+                self.pure_context_history.append(self.pure_context_out_var)
+                self.pure_context_out_var = saved_out_var
+                
+        return result
       
     def _ast_nodes_equal(self, n1, n2):
         if n1 is None and n2 is None:       return True
@@ -868,22 +915,6 @@ class Compiler:
         self.local_fp_offset = start_fp_offset
         platform.push(platform.t0)
     
-    def CallerContext(self, node):
-        saved_pure = self.pure_context_out_var
-        popped = False
-        saved_history_val = None
-        
-        if self.pure_context_history:
-            saved_history_val = self.pure_context_history.pop()
-            self.pure_context_out_var = saved_history_val
-            popped = True
-            
-        self._compile_node(node.left)
-        
-        if popped:
-            self.pure_context_history.append(saved_history_val)
-        self.pure_context_out_var = saved_pure
-      
     def _compile_statement_sequence(self, children):
         old_lhs = getattr(self, 'current_assignment_lhs', None)
         
@@ -900,32 +931,6 @@ class Compiler:
 
         self.current_assignment_lhs = old_lhs
 
-    def Block(self, node):
-        start_fp_offset = getattr(self, 'local_fp_offset', 0)
-        
-        platform.start_scope()
-        self.enter_scope()
-        
-        self._compile_statement_sequence(node.children)
-        
-        self.exit_scope()
-        platform.end_scope(returns=0)
-
-        self.local_fp_offset = start_fp_offset
-
-    def Program(self, node):
-        old_ctx = getattr(self, 'current_type_context', None)
-        self.current_type_context = "main"
-        
-        platform.emit_instruction("addi", platform.get_register("fp"), platform.get_register("sp"), 0)
-        
-        platform.start_scope()
-        self._compile_statement_sequence(node.children)
-        platform.end_scope(returns=0)
-        
-        self.current_type_context = old_ctx
-        platform.halt()
-    
     def MacroDef(self, node):
         pass
 
@@ -988,11 +993,7 @@ class Compiler:
                 eval_args.append({'type': 'literal', 'val': val})
                 continue
 
-            arg_eval = arg
-            while getattr(arg_eval, 'node_type', None) == NodeType.CallerContext:
-                arg_eval = arg_eval.left
-
-            name = getattr(arg_eval, 'value', None)
+            name = getattr(arg, 'value', None)
             is_output = (i == 0 and has_rd)
             
             if isinstance(name, str) and platform.is_register(name):
@@ -1040,9 +1041,10 @@ class Compiler:
                 args.append(e['val'])
             else: 
                 args.append(e['val'])
-                
-        platform.emit_instruction(inst_name, *args)
-        
+        try:        
+            platform.emit_instruction(inst_name, *args)
+        except AttributeError :
+            raise AttributeError(f"attrib error raised from node: {inst_name}, {self.current_type_context} {node.line}:{node.col}")
         if store_back_sym:
             platform.write_local(store_back_sym.fp_offset, rd_reg_to_push, output_name)
             platform.end_scope(returns=0)

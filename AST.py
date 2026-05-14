@@ -5,12 +5,10 @@ from typing import List, Any, Optional, Dict
 from tokens import Token, TokenType
 
 class NodeType(Enum):
-    Program = auto()
     Block = auto()
     Pipeline = auto()       
     Assignment = auto()     
-    Tuple = auto()          
-    Expression = auto()
+    Tuple = auto()         
     Identifier = auto()
     Value = auto()
     Intrinsic = auto()      
@@ -18,7 +16,6 @@ class NodeType(Enum):
     MacroCall = auto()  
     Call = auto()            
     FunctionDef = auto()    
-    CallerContext = auto()  
     Lens = auto()               
 
 @dataclass
@@ -35,6 +32,7 @@ class ASTNode:
     is_comptime_safe: bool = None 
     line: int = 0
     col: int = 0
+    caller_context_depth: int = 0
     
     def is_body_pure(self) -> bool:
         """Return True if the AST subtree contains no visible mutation."""
@@ -117,7 +115,7 @@ def build_type_name(node):
     return str(getattr(node, 'value', node))
 
 def substitute_ast(node, captured):
-    assert isinstance(captured, dict), f"substitute_ast requires a dictionary of captured bindings, got {type(captured)}"
+    assert isinstance(captured, dict), f"substitute_ast requires a dictionary of captured bindings"
     if node is None:
         return None
         
@@ -125,25 +123,28 @@ def substitute_ast(node, captured):
         if node.value in captured:
             copied = copy.deepcopy(captured[node.value])
             assert isinstance(copied, ASTNode), "Captured value to substitute must be an ASTNode"
-            return ASTNode(NodeType.CallerContext, left=copied, line=getattr(node, 'line', 0), col=getattr(node, 'col', 0))
+            copied.caller_context_depth += 1   
+            copied.line = getattr(node, 'line', 0)
+            copied.col = getattr(node, 'col', 0)
+            return copied
         return node
         
     if isinstance(node, ASTNode) and node.node_type == NodeType.Identifier:
         if node.value in captured:
             copied = copy.deepcopy(captured[node.value])
             assert isinstance(copied, ASTNode), "Captured value to substitute must be an ASTNode"
-            return ASTNode(NodeType.CallerContext, left=copied, line=node.line, col=node.col)
+            copied.caller_context_depth += 1  
+            copied.line = node.line
+            copied.col = node.col
+            return copied
             
     new_node = copy.copy(node) 
     if getattr(new_node, 'left', None):
         new_node.left = substitute_ast(new_node.left, captured)
-        assert isinstance(new_node.left, ASTNode), "Substituted left child must be an ASTNode"
     if getattr(new_node, 'right', None):
         new_node.right = substitute_ast(new_node.right, captured)
-        assert isinstance(new_node.right, ASTNode), "Substituted right child must be an ASTNode"
     if getattr(new_node, 'children', None):
         new_node.children = [substitute_ast(c, captured) for c in new_node.children]
-        assert all(isinstance(c, ASTNode) for c in new_node.children), "All substituted children must be ASTNodes"
         
     return new_node
 
@@ -221,7 +222,7 @@ class Parser:
 
     def parse_program(self):
         assert self.tokens is not None, "Parser initialized without tokens"
-        root = ASTNode(NodeType.Program, line=1, col=1)
+        root = ASTNode(NodeType.Block, line=1, col=1)
         while self.peek():
             stmt = self.parse_expr()
             if stmt: 

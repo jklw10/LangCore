@@ -92,8 +92,46 @@ class RiscVAssembler:
     def sltiu(self, rd, rs1, imm):
         """rd = (rs1 < imm) ? 1 : 0 (unsigned)"""
         self._i_type(0x13, rd, rs1, imm, 0x3)
+
+    def slli(self, rd, rs1, shamt):
+        """
+        Shift Left Logical Immediate
+        rd = rs1 << shamt
+        """
+        opcode = 0x13  # OP-IMM (same as ADDI)
+        funct3 = 0x1   # SLLI funct3
+        imm = shamt & 0x1F # Restrict to 5 bits (0-31) for RV32
+        
+        self._i_type(opcode, rd, rs1, imm, funct3)
+    def srli(self, rd, rs1, shamt):
+        """ Shift Right Logical Immediate (Zero extension) """
+        opcode = 0x13
+        funct3 = 0x5
+        imm = shamt & 0x1F
+        self._i_type(opcode, rd, rs1, imm, funct3)
+
+    def srai(self, rd, rs1, shamt):
+        """ Shift Right Arithmetic Immediate (Sign extension) """
+        opcode = 0x13
+        funct3 = 0x5
+        # For SRAI, the upper 7 bits of the 12-bit immediate are 0100000 (0x20)
+        # So we shift 0x20 left by 5 bits to place it at the top of the 12-bit imm
+        imm = (0x20 << 5) | (shamt & 0x1F) 
+        self._i_type(opcode, rd, rs1, imm, funct3)
+
+    
+                
+    #1 => cpu.regs[dest] = val1 << @as(u5, @truncate(val2)), // SLL
+    #5 => {
+    #    const shift = @as(u5, @truncate(val2));
+    #    if (f7 == 0) cpu.regs[dest] = val1 >> shift // SRL
+    #    else cpu.regs[dest] = @as(u32, @bitCast(@as(i32, @bitCast(val1)) >> shift)); // SRA
     
     # --- Register Arithmetic ---
+    def sll(self, rd, rs1, rs2): 
+        self._r_type(0x33, rd, rs1, rs2, 0x1, 0x00)
+    def srl(self, rd, rs1, rs2): 
+        self._r_type(0x33, rd, rs1, rs2, 0x5, 0x00)
     def add(self, rd, rs1, rs2): 
         self._r_type(0x33, rd, rs1, rs2, 0x0, 0x00)
         
@@ -135,7 +173,7 @@ class RiscVAssembler:
         
     def sb(self, rs1, offset, rs2):
         self._s_type(0x23, rs1, rs2, offset, 0x0)
-        
+
     # --- Branching ---
     def jal(self, rd, label):
         offset = self._resolve_or_record(label, 'J')

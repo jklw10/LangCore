@@ -21,7 +21,7 @@ this is a complete hallucination, but it does bring an interesting thought, what
 Every major construct in the language (functions, namespaces, macros, types) is structurally identical. They all follow a single **Lambda / Pattern-Matching** syntax:
 
 ```rs
-binder : block_identifier = (bindings) : { body }
+binder : named_returns = (bindings) : { body }
 ```
 
 *   **Functions:** `foo : res[int] = (x, y) : { res = x + y; }`
@@ -85,3 +85,23 @@ The compiler prioritizes evaluating logic at compile time before emitting raw as
     2.  *Generic Propagation:* Unspecified types (raw literals) are inferred based on usage pipelines.
     3.  *Dynamic:* Only state dependent on IO or runtime memory falls back to dynamic assembly branching.
 *   **Modules:** Every `.w` file acts as both an executable script and a library. Files imported via `@import` and `@using` allow safe, block-scoped macro injection, keeping imported libraries from globally polluting the host file's operator precedence.
+
+## 9. The Physical Meaning of `.` (Static vs. Stack)
+The language eliminates the Object-Oriented ghost of "instances." Because there is no hidden heap and no opaque objects, a type is merely a *Lens*—a pure function that slices the stack. 
+
+The `.` prefix serves a strict, physical hardware purpose: **It dictates whether an operation targets the dynamic stack or the static binary segment.**
+
+*   **No Dot (Stack / Execution Flow):** Dotless identifiers represent dynamic stack manipulation or global execution flow.
+    *   `value = bytes`: "Map this local stack data to the return slot."
+    *   `div_rem : ...`: "Emit this function block into the context as a standard label."
+*   **With Dot (Static / Namespace Registry):** The `.` prefix explicitly tells the compiler: *"Bypass the dynamic stack and anchor this construct statically to the `{}` namespace I am currently inside."*
+    *   `.str = "hello"`: Emits bytes directly into the static `.rodata` segment.
+    *   `.max = 0x7fff`: Binds a constant to the namespace's static dictionary (`int.max`).
+    *   `.rand : ...`: Emits a function block, legally binding its label to the namespace (`int.rand`).
+    *   `.@expr`: Emits a macro directly into the compiler's static Macro Registry.
+
+## 10. Namespace Hygiene and Explicit Imports
+The language enforces strict namespace hygiene to prevent accidental global pollution. 
+
+Dotless functions (like `div_rem`) defined inside a file or module are not "private" in the traditional OOP sense—they are simply untethered to a specific type lens. However, **implicit importing is banned.** 
+If File A defines a dotless `div_rem`, File B cannot accidentally execute it just by importing File A. File B must explicitly invoke `@using(File A)` to pull those untethered symbols into its active routing scope, ensuring that operator precedence and global functions are never polluted by accident.
