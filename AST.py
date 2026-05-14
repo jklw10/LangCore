@@ -11,11 +11,9 @@ class NodeType(Enum):
     Tuple = auto()         
     Identifier = auto()
     Value = auto()
-    Intrinsic = auto()      
-    MacroDef = auto()       
-    MacroCall = auto()  
+    Intrinsic = auto()    
     Call = auto()            
-    FunctionDef = auto()    
+    Definition = auto()    
     Lens = auto()               
 
 @dataclass
@@ -33,26 +31,9 @@ class ASTNode:
     line: int = 0
     col: int = 0
     caller_context_depth: int = 0
-    
-    def is_body_pure(self) -> bool:
-        """Return True if the AST subtree contains no visible mutation."""
-        if self is None:
-            return True
-        if self.node_type == NodeType.Assignment:
-            if getattr(self.left, 'node_type', None) == NodeType.Lens and self.left.left is None:
-                return False
-        if self.node_type == NodeType.Intrinsic and self.value == "asm":
-            if self.children and self.children[0].value in ("store", "sw", "sh", "sb", "ecall",): 
-                return False
-        
-        for child in getattr(self, 'children', []):
-            if isinstance(child, ASTNode) and not child.is_body_pure():
-                return False
-        if getattr(self, 'left', None) and isinstance(self.left, ASTNode) and not self.left.is_body_pure():
-            return False
-        if getattr(self, 'right', None) and isinstance(self.right, ASTNode) and not self.right.is_body_pure():
-            return False
-        return True
+    vmg_pure_out_target: Any = None 
+    macro_owner = ""
+
 
 class MacroRule:
     def __init__(self, prec, pattern, holes, out_name, body, hole_types=None, out_type=None, is_mutating=False):
@@ -115,7 +96,7 @@ def build_type_name(node):
     return str(getattr(node, 'value', node))
 
 def substitute_ast(node, captured):
-    assert isinstance(captured, dict), f"substitute_ast requires a dictionary of captured bindings"
+    assert isinstance(captured, dict), "substitute_ast requires a dictionary of captured bindings"
     if node is None:
         return None
         
@@ -449,7 +430,7 @@ class Parser:
                 if is_func:
                     if right.node_type == NodeType.Pipeline and right.right.node_type == NodeType.Block:
                         assert ret_node is not None, "Function definition requires valid return mapping"
-                        func_node = ASTNode(NodeType.FunctionDef, 
+                        func_node = ASTNode(NodeType.Definition, 
                                        value=func_name, 
                                        left=ret_node, 
                                        right=right.left, 
@@ -536,8 +517,10 @@ class Parser:
                 expanded_body = substitute_ast(rule.body, captured)
                 assert isinstance(expanded_body, ASTNode) or expanded_body is None, "Macro expansion failed to produce a valid ASTNode"
                 
-                return ASTNode(NodeType.MacroCall, value=rule.out_name, left=expanded_body, type_name=rule.out_type, is_pure=not rule.is_mutating, line=token.line, col=token.col)
-            
+                expanded_body.vmg_pure_out_target = rule.out_name # Tells the compiler backend to lock mutation
+                expanded_body.is_pure = not rule.is_mutating  
+                expanded_body.macro_owner = "int" 
+                return expanded_body
             except SyntaxError as e:
                 last_error = e
                 self.i = saved_i 
@@ -609,7 +592,6 @@ class Parser:
         
         rule = MacroRule(prec, pattern, holes, out_name, body, hole_types, out_type, is_mutating)
         self.registry.register(rule)
-        return ASTNode(NodeType.MacroDef, macro_rule=rule, line=token.line, col=token.col)
 
     def parse_asm_intrinsic(self, token):
         assert token is not None, "parse_asm_intrinsic requires a valid token"

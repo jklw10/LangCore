@@ -6,6 +6,27 @@ from typing import Dict, List, Optional
 from dataclasses import dataclass
 import ctypes
 
+
+def is_body_pure(self) -> bool:
+    """Return True if the AST subtree contains no visible mutation."""
+    if self is None:
+        return True
+    if self.node_type == NodeType.Assignment:
+        if getattr(self.left, 'node_type', None) == NodeType.Lens and self.left.left is None:
+            return False
+    if self.node_type == NodeType.Intrinsic and self.value == "asm":
+        if self.children and platform.is_mutating_instruction(self.children[0].value): 
+            return False
+    
+    for child in getattr(self, 'children', []):
+        if isinstance(child, ASTNode) and not child.is_body_pure():
+            return False
+    if getattr(self, 'left', None) and isinstance(self.left, ASTNode) and not self.left.is_body_pure():
+        return False
+    if getattr(self, 'right', None) and isinstance(self.right, ASTNode) and not self.right.is_body_pure():
+        return False
+    return True
+
 class ComptimeFolder:
     def __init__(self, cpu_lib, cpu_state_type, full_ast):
         self.lib = cpu_lib
@@ -14,8 +35,9 @@ class ComptimeFolder:
         
     def extract_functions(self, node):
         funcs = []
-        if not node: return funcs
-        if node.node_type == NodeType.FunctionDef:
+        if not node: 
+            return funcs
+        if node.node_type == NodeType.Definition:
             funcs.append(node)
         for child in getattr(node, 'children', []):
             funcs.extend(self.extract_functions(child))
@@ -82,7 +104,7 @@ class ComptimeFolder:
         if getattr(n, 'caller_context_depth', 0) > 0:
             if n.node_type != NodeType.Value: 
                 return False
-            return True # Values have no children, so we can exit safely
+            return True 
             
         for c in getattr(n, 'children', []): 
             if not self.has_only_static_caller_contexts(c): return False
@@ -116,8 +138,8 @@ class ComptimeFolder:
                     except Exception:
                         pass
                         
-        elif node.node_type == NodeType.MacroCall and getattr(node, 'is_pure', False):
-            if self.has_only_static_caller_contexts(node.left):
+        if getattr(node, 'vmg_pure_out_target', None) and getattr(node, 'is_pure', False):
+            if self.has_only_static_caller_contexts(node):
                 try:
                     val = self.evaluate_node(node)
                     if val is not None:
@@ -126,6 +148,7 @@ class ComptimeFolder:
                         node.children = []
                         node.left = None
                         node.right = None
+                        node.vmg_pure_out_target = None # Prevent compiler wrapping it again
                 except Exception:
                     pass
 
@@ -192,7 +215,7 @@ class Workspace:
             self.discover_file(node.children[0].value)
             return
             
-        if node.node_type == NodeType.FunctionDef:
+        if node.node_type == NodeType.Definition:
             assert isinstance(node.value, str) and node.value, "Function definition must possess a structural name string"
             
             func_name = node.value
@@ -292,13 +315,12 @@ class Compiler:
     def compile(self, node: ASTNode):
         platform.init()
         self._register_functions(node)
-        old_ctx = getattr(self, 'current_type_context', None)
-        self.current_type_context = "main"
+        #TODO: check if file name should be injected here or smth
+        self.current_type_context = getattr(self, 'current_type_context', "main")
         
         platform.emit_instruction("addi", platform.get_register("fp"), platform.get_register("sp"), 0)
         
         platform.start_scope()
-        #self._compile_node(node)
         self._compile_statement_sequence(node.children)
         platform.end_scope(returns=0)
         
@@ -323,7 +345,7 @@ class Compiler:
         if not node: 
             return
         
-        if node.node_type == NodeType.FunctionDef:
+        if node.node_type == NodeType.Definition:
             func_name = node.value
             
             if func_name.startswith(".") and current_type_context:
@@ -402,9 +424,49 @@ class Compiler:
                     popped_states.append(self.pure_context_out_var)
                     self.pure_context_out_var = self.pure_context_history.pop()
 
+        # --- THE MACRO HARDWARE WRAPPER ---
+        has_vmg = getattr(node, 'vmg_pure_out_target', None) is not None
+        if has_vmg:
+            self.macro_expansion_counter += 1
+            self.macro_expansion_stack.append(self.macro_expansion_counter)
+            
+            self.enter_scope()
+            platform.start_scope()
+            start_fp_offset = getattr(self, 'local_fp_offset', 0)
+            
+            old_pure_out_var = self.pure_context_out_var
+            self.pure_context_history.append(old_pure_out_var)
+            self.pure_context_out_var = node.vmg_pure_out_target
+            
+            # Physically allocate the output slot for the macro
+            platform.push(platform.x0)
+            out_sym = self.declare_symbol(node.vmg_pure_out_target)
+
+            old_lhs = getattr(self, 'current_assignment_lhs', None)
+            self.current_assignment_lhs = None
+
+        # Execute the unrolled node
         method_name = node.node_type.name
         visitor = getattr(self, method_name, self.error)
         result = visitor(node)
+
+        # --- EXTRACT THE MACRO RESULT ---
+        if has_vmg:
+            self.current_assignment_lhs = old_lhs
+            
+            # Extract the calculated value from local memory
+            platform.read_local(platform.t0, out_sym.fp_offset, node.vmg_pure_out_target)
+            self.exit_scope()
+            platform.end_scope(returns=0)
+            self.local_fp_offset = start_fp_offset
+            
+            self.pure_context_history.pop()
+            self.pure_context_out_var = old_pure_out_var
+            
+            self.macro_expansion_stack.pop()
+            
+            # Push it so the parent Assignment receives exactly 1 item!
+            platform.push(platform.t0)
 
         # Winding Up (Restoring Macro context)
         if depth > 0:
@@ -478,7 +540,7 @@ class Compiler:
         platform.read_local(platform.t0, sym.fp_offset, node.value) 
         platform.push(platform.t0)
 
-    def FunctionDef(self, node):
+    def Definition(self, node):
         func_name = node.value
         if func_name.startswith(".") and getattr(self, 'current_type_context', None):
             func_name = self.current_type_context + func_name
