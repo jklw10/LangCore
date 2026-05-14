@@ -6,6 +6,7 @@ import platform
 import compiler
 import disasm 
 import sys
+
 def load_cpu_lib():
     """Loads the RISC-V CPU C library."""
     lib_name = "cpu.dll" if os.name == 'nt' else "libcpu.so"
@@ -28,16 +29,16 @@ def load_cpu_lib():
     
     return lib, RiscVState
 
-def compile_file(filepath):
+def compile_file(filepath, lib, RiscVState):
     """Compiles a single .w file and returns the binary."""
-    # Reset the global assembler state from macros to prevent code merging
+    # Reset the global assembler state
     platform.asm.code = bytearray()
     platform.asm.labels = {}
     platform.asm.fixups = {}
     platform.asm.pc = 0
     
-    # 4-Pass Compilation using the new Workspace implementation
-    workspace = compiler.Workspace()
+    # 5-Pass Compilation using the Workspace implementation (Now with Native Comptime)
+    workspace = compiler.Workspace(cpu_lib=lib, cpu_state_type=RiscVState)
     compiled_asm = workspace.compile_project(filepath)
     
     return compiled_asm.get_binary()
@@ -49,47 +50,40 @@ def run_program(lib, RiscVState, filepath):
     print(f"{'='*40}")
     
     try:
-        program_bytes = compile_file(filepath)
+        program_bytes = compile_file(filepath, lib, RiscVState)
     except Exception as e:
         print(f"Compilation failed for {filepath}: {e}")
         traceback.print_exc()
         return
     
-    # 1. Output the raw binary for external tools (e.g. objdump)
     bin_filename = filepath.replace(".w", ".bin")
     with open(bin_filename, "wb") as f:
         f.write(program_bytes)
     print(f"Saved binary to {bin_filename}")
     
-    # 2. Print human-readable Disassembly
     disasm.disassemble(program_bytes)
     
     cpu_state = RiscVState()
     lib.init_cpu(ctypes.byref(cpu_state))
     
-    # Load program into memory
     for i, byte in enumerate(program_bytes):
         cpu_state.memory[i] = byte
         
     cycles = 0
-    cpu_state.memory[65000] = 255 # Initialize with a dummy flag
+    cpu_state.memory[65000] = 255 
 
-    # Run loop
     while not cpu_state.halt and cycles < 100000:
         lib.run_cycles(ctypes.byref(cpu_state), 1)
         cycles += 1
         
-        # Check simulated Memory-Mapped I/O at address 65000
         val = cpu_state.memory[65000]
         if val != 255:
             print(f"[{cycles} cycles] Memory[65000] received value: {val}")
-            
             cpu_state.memory[65000] = 255
 
     print(f"\nExecution finished in {cycles} cycles.")
     print(f"Final SP (x2): 0x{cpu_state.regs[2]:08x}")
     
-    # Print the return value register (a0 / x10) if you use it globally
     if cpu_state.regs[10] != 0:
         print(f"Final a0 (x10): {cpu_state.regs[10]}")
 
@@ -103,7 +97,6 @@ def main(args):
         return
 
     test_files = sorted(glob.glob("tests/*.w"))
-    
     if not test_files:
         print("No .w files found. Save some test scripts in this directory.")
         return
@@ -112,5 +105,4 @@ def main(args):
         run_program(lib, RiscVState, test_file)
 
 if __name__ == "__main__":
-      
-    main(sys.argv[1])
+    main(sys.argv[1] if len(sys.argv) > 1 else None)

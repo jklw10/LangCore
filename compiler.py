@@ -4,28 +4,158 @@ import AST
 from AST import NodeType, ASTNode
 from typing import Dict, List, Optional
 from dataclasses import dataclass
+import ctypes
+
+class ComptimeFolder:
+    def __init__(self, cpu_lib, cpu_state_type, full_ast):
+        self.lib = cpu_lib
+        self.RiscVState = cpu_state_type
+        self.functions = self.extract_functions(full_ast)
+        
+    def extract_functions(self, node):
+        funcs = []
+        if not node: return funcs
+        if node.node_type == NodeType.FunctionDef:
+            funcs.append(node)
+        for child in getattr(node, 'children', []):
+            funcs.extend(self.extract_functions(child))
+        if getattr(node, 'left', None): funcs.extend(self.extract_functions(node.left))
+        if getattr(node, 'right', None): funcs.extend(self.extract_functions(node.right))
+        return funcs
+
+    def evaluate_node(self, node):
+        # Reset the platform for micro-compilation
+        platform.init()
+        platform.asm.code = bytearray()
+        platform.asm.labels = {}
+        platform.asm.fixups = {}
+        platform.asm.pc = 0
+        
+        # Jump over function definitions
+        platform.jump("comptime_main")
+        
+        temp_comp = Compiler()
+        for f in self.functions:
+            temp_comp._register_functions(f)
+            
+        for f in self.functions:
+            temp_comp._compile_node(f)
+            
+        platform.label("comptime_main")
+        platform.emit_instruction("addi", platform.get_register("fp"), platform.get_register("sp"), 0)
+        
+        # Micro-compile the isolated node
+        platform.start_scope()
+        temp_comp._compile_node(node)
+        platform.end_scope(returns=1)
+        
+        platform.pop(platform.get_register("a0"))
+        platform.halt()
+        
+        bin_data = platform.get_binary()
+        
+        # Run Native CPU Emulator Sandbox
+        cpu = self.RiscVState()
+        self.lib.init_cpu(ctypes.byref(cpu))
+        for i, b in enumerate(bin_data):
+            cpu.memory[i] = b
+            
+        cycles = 0
+        while not cpu.halt and cycles < 50000:
+            self.lib.run_cycles(ctypes.byref(cpu), 1)
+            cycles += 1
+            
+        if cycles >= 50000:
+            raise TimeoutError("Comptime execution exceeded max cycle limit")
+            
+        val = cpu.regs[10]
+        # Standardize 32-bit uint back to signed integer format for the AST
+        if val >= 0x80000000:
+            val -= 0x100000000
+        return val
+
+    def has_only_static_caller_contexts(self, n):
+        if not n: return True
+        if n.node_type == NodeType.CallerContext:
+            return getattr(n.left, 'node_type', None) == NodeType.Value
+        for c in getattr(n, 'children', []): 
+            if not self.has_only_static_caller_contexts(c): return False
+        if getattr(n, 'left', None) and not self.has_only_static_caller_contexts(n.left): return False
+        if getattr(n, 'right', None) and not self.has_only_static_caller_contexts(n.right): return False
+        return True
+
+    def fold(self, node: ASTNode):
+        if not node: return
+        
+        for child in getattr(node, 'children', []): self.fold(child)
+        if getattr(node, 'left', None): self.fold(node.left)
+        if getattr(node, 'right', None): self.fold(node.right)
+        
+        if node.node_type == NodeType.Call:
+            if all(getattr(c, 'node_type', None) == NodeType.Value for c in node.children):
+                is_pure = False
+                for f in self.functions:
+                    if f.value == node.value and f.children[0].is_body_pure():
+                        is_pure = True
+                        break
+                if is_pure:
+                    try:
+                        val = self.evaluate_node(node)
+                        if val is not None:
+                            node.node_type = NodeType.Value
+                            node.value = val
+                            node.children = []
+                            node.left = None
+                            node.right = None
+                    except Exception:
+                        pass
+                        
+        elif node.node_type == NodeType.MacroCall and getattr(node, 'is_pure', False):
+            if self.has_only_static_caller_contexts(node.left):
+                try:
+                    val = self.evaluate_node(node)
+                    if val is not None:
+                        node.node_type = NodeType.Value
+                        node.value = val
+                        node.children = []
+                        node.left = None
+                        node.right = None
+                except Exception:
+                    pass
 
 class Workspace:
-    def __init__(self):
+    def __init__(self, cpu_lib=None, cpu_state_type=None):
         self.global_types = {} 
         self.global_macros = {}
         self.macro_registry = AST.MacroRegistry()
         self.loaded_files = set()
+        self.cpu_lib = cpu_lib
+        self.cpu_state_type = cpu_state_type
 
     def compile_project(self, main_filepath):
         assert isinstance(main_filepath, str) and main_filepath, "Project entry point must be a valid, non-empty file path string"
-        assert main_filepath.endswith('.w') or '.' in main_filepath, "File extension expected for main source file"
         
         self.discover_file(main_filepath)
         full_ast = self.semantic_parse_file(main_filepath)
         
         assert full_ast.node_type == NodeType.Program, "Compilation structural entry point must be a Program node"
         
+        # JIT COMPTIME FOLD PASS
+        if self.cpu_lib and self.cpu_state_type:
+            folder = ComptimeFolder(self.cpu_lib, self.cpu_state_type, full_ast)
+            folder.fold(full_ast)
+        
+        # Reset platform explicitly after Comptime micro-compilations finish
+        platform.init()
+        platform.asm.code = bytearray()
+        platform.asm.labels = {}
+        platform.asm.fixups = {}
+        platform.asm.pc = 0
+
         comp = Compiler()
         result_platform = comp.compile(full_ast)
         
-        assert result_platform is not None, "Compiler failed to yield a valid assembly block representation"
-        assert hasattr(result_platform, 'get_code_length') and result_platform.get_code_length() > 0, "Compilation critically output zero executable machine code instructions targeting bare minimum evaluation"
+        assert hasattr(result_platform, 'get_code_length') and result_platform.get_code_length() > 0, "Compilation critically output zero executable machine code instructions"
         return result_platform
 
     def discover_file(self, filepath):
@@ -361,7 +491,7 @@ class Compiler:
             if p_name is not None:
                 self.scopes[-1][p_name] = SymbolInfo(fp_offset=arg_offset)
             arg_offset += 1
-            
+        
         self.local_fp_offset = 0
         
         platform.push(platform.x0)
@@ -392,6 +522,9 @@ class Compiler:
         safe_regs = platform.get_safe_regs()
         
         if ret_nodes:
+            #TODO: stackbleed.
+            assert len(ret_nodes) <= len(safe_regs), f"Function {func_name} exceeds maximum allowed return values ({len(safe_regs)})"
+
             for i, rv in enumerate(ret_nodes):
                 if rv.node_type == NodeType.Identifier:
                     sym = self.get_symbol(rv.value)
@@ -419,7 +552,6 @@ class Compiler:
         
         platform.label(skip_label)
 
-    # ----------
 
     def Call(self, node):
         func_name = node.value

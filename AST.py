@@ -35,6 +35,26 @@ class ASTNode:
     is_comptime_safe: bool = None 
     line: int = 0
     col: int = 0
+    
+    def is_body_pure(self) -> bool:
+        """Return True if the AST subtree contains no visible mutation."""
+        if self is None:
+            return True
+        if self.node_type == NodeType.Assignment:
+            if getattr(self.left, 'node_type', None) == NodeType.Lens and self.left.left is None:
+                return False
+        if self.node_type == NodeType.Intrinsic and self.value == "asm":
+            if self.children and self.children[0].value in ("store", "sw", "sh", "sb", "ecall",): 
+                return False
+        
+        for child in getattr(self, 'children', []):
+            if isinstance(child, ASTNode) and not child.is_body_pure():
+                return False
+        if getattr(self, 'left', None) and isinstance(self.left, ASTNode) and not self.left.is_body_pure():
+            return False
+        if getattr(self, 'right', None) and isinstance(self.right, ASTNode) and not self.right.is_body_pure():
+            return False
+        return True
 
 class MacroRule:
     def __init__(self, prec, pattern, holes, out_name, body, hole_types=None, out_type=None, is_mutating=False):
@@ -154,29 +174,6 @@ class Parser:
             if t.type != TokenType.EOF:
                 return t
         return None
-    
-    def is_body_pure(self: ASTNode) -> bool:
-        """Return True if the AST subtree contains no visible mutation."""
-        if self is None:
-            return True
-        if self.node_type == NodeType.Assignment:
-            if self.left.node_type == NodeType.Lens and self.left.left is None:
-                return False
-            # assignment to normal variable is pure (updates local scope)
-        if self.node_type == NodeType.Intrinsic and self.value == "asm":
-            # check for store/sw/sb instructions
-            inst = self.children[0].value
-            if inst in ("store", "sw", "sb"): #TODO: grab from platform. or delay till compiler. whole thing should be moved to compiler probably.
-                return False
-        # check children
-        for child in (self.left, self.right):
-            if isinstance(child, ASTNode) and not child.is_body_pure():
-                return False
-        if hasattr(self, 'children'):
-            for child in self.children:
-                if isinstance(child, ASTNode) and not child.is_body_pure():
-                    return False
-        return True
     
     def consume(self, expected_type: TokenType = None):
         assert expected_type is None or isinstance(expected_type, TokenType), f"consume expected TokenType Enum, got {type(expected_type)}"
