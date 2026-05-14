@@ -50,7 +50,7 @@ parse_loop : _ = (0, ptr[int], max_ptr[int]) : {
 
 
 // --- Main Execution ---
-bytes_read = sys.read_stdin(SOURCE_PTR, MAX_LEN);
+bytes_read = sys.read(SOURCE_PTR, MAX_LEN);
 
 // Assert we actually read a file
 assert(bytes_read > 0);

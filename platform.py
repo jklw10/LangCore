@@ -2,15 +2,18 @@ from asm import RiscVAssembler
 
 # Create the assembler
 asm = RiscVAssembler()
-x0 = 0      #register 
-ra = 1      #register
-t0 = 5      #register
-t1 = 6      #register 
-t2 = 7      #register
-t3 = 28     #register
-a0 = 10     #register
-a7 = 17     #register
-
+#expected registers
+x0 = 0       
+ra = 1      
+t0 = 5      
+t1 = 6       
+t2 = 7      
+t3 = 28      
+a1 = 11
+a7 = 17     
+fp = 8
+sp = 2
+a0 = 10
 reg_map = {f"x{i}": i for i in range(32)}
 reg_map.update({
     "zero": 0, "ra": 1, "sp": 2, "gp": 3, "tp": 4,
@@ -51,9 +54,6 @@ def abandon_scope():
     if scope_depths:
         scope_depths.pop()
 
-def compile_time_adjust_stack(delta):
-    global current_stack_slots
-    current_stack_slots += delta
 
 def end_scope(returns=0):
     global current_stack_slots

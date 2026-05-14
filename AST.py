@@ -11,10 +11,13 @@ class NodeType(Enum):
     Tuple = auto()         
     Identifier = auto()
     Value = auto()
-    Intrinsic = auto()    
     Call = auto()            
     Definition = auto()    
-    Lens = auto()               
+    Lens = auto()
+    Asm = auto()
+    Import = auto()
+    Embed = auto()
+    Using = auto()
 
 @dataclass
 class ASTNode:
@@ -24,8 +27,9 @@ class ASTNode:
     right: Optional['ASTNode'] = None
     children: List['ASTNode'] = field(default_factory=list)
     macro_rule: Any = None
-    type_name: str = None  
+    type_node: Any = None  # Structurally stored AST node instead of string
     is_pure: bool = False  
+    is_static: bool = False # Marks namespace-resolved identifiers as static targets
     macro_scope: Any = None
     is_comptime_safe: bool = None 
     line: int = 0
@@ -33,7 +37,6 @@ class ASTNode:
     caller_context_depth: int = 0
     vmg_pure_out_target: Any = None 
     macro_owner = ""
-
 
 class MacroRule:
     def __init__(self, prec, pattern, holes, out_name, body, hole_types=None, out_type=None, is_mutating=False):
@@ -82,18 +85,22 @@ class MacroRegistry:
                 return scope[token_val]
         return None
 
-def build_type_name(node):
-    """Safely constructs a string representation of complex AST types like [0:1]"""
-    assert node is None or isinstance(node, ASTNode) or isinstance(node, str), f"build_type_name expected ASTNode or str, got {type(node)}"
+def ast_nodes_equal(n1, n2):
+    """Deep structural equality check for AST nodes, heavily used for Type mapping."""
+    if n1 is None and n2 is None:       return True
+    if n1 is None or n2 is None:        return False
     
-    #if not node: return ""
-    if getattr(node, 'node_type', None) == NodeType.Identifier: return node.value
-    if getattr(node, 'node_type', None) == NodeType.Value: return str(node.value)
-    if getattr(node, 'node_type', None) == NodeType.Pipeline:
-        return f"{build_type_name(node.left)}:{build_type_name(node.right)}"
-    if getattr(node, 'node_type', None) == NodeType.Tuple:
-        return ",".join(build_type_name(c) for c in node.children)
-    return str(getattr(node, 'value', node))
+    if not isinstance(n1, ASTNode) or not isinstance(n2, ASTNode):
+        return n1 == n2
+
+    if n1.node_type != n2.node_type:    return False
+    if n1.value != n2.value:            return False
+    if len(n1.children) != len(n2.children):    return False
+    for c1, c2 in zip(n1.children, n2.children):
+        if not ast_nodes_equal(c1, c2): return False
+    if not ast_nodes_equal(n1.left, n2.left):     return False
+    if not ast_nodes_equal(n1.right, n2.right):   return False
+    return True
 
 def substitute_ast(node, captured):
     assert isinstance(captured, dict), "substitute_ast requires a dictionary of captured bindings"
@@ -140,9 +147,9 @@ class Parser:
         self.exported_macros = exported_macros if exported_macros is not None else {}
         self.import_callback = import_callback
 
-    def declare_type(self, name, type_name):
-        if name and type_name:
-            self.type_scopes[-1][name] = type_name
+    def declare_type(self, name, type_node):
+        if name and type_node:
+            self.type_scopes[-1][name] = type_node
 
     def get_type(self, name):
         for scope in reversed(self.type_scopes):
@@ -300,11 +307,9 @@ class Parser:
                     assert name_t is not None, "Expected identifier after '.@'"
                     if name_t.value == 'expr':
                         return self.parse_macro_def(name_t)
-                    elif name_t.value == 'asm':
-                        return self.parse_asm_intrinsic(name_t)
                 elif getattr(next_t, 'type', None) == TokenType.IDENTIFIER:
                     node = ASTNode(NodeType.Identifier, value="." + next_t.value, line=t.line, col=t.col)
-                    node.type_name = self.get_type("." + next_t.value)
+                    node.type_node = self.get_type("." + next_t.value)
                     return node
                 raise SyntaxError(f"Unexpected token after '.' at line {t.line}:{t.col}")
                 
@@ -317,7 +322,7 @@ class Parser:
                     return self.parse_asm_intrinsic(t)
                 elif next_t.value in ('import', 'embed', 'using'):
                     self.match('(')
-                    path_tokens =[]
+                    path_tokens = []
                     while self.peek() and not getattr(self.peek(), 'value', None) == ')':
                         path_tokens.append(str(getattr(self.consume(), 'value', '')))
                     self.match(')')
@@ -325,19 +330,26 @@ class Parser:
                     path_str = "".join(path_tokens)
                     assert path_str, "Path string cannot be empty in import/embed/using"
                     
-                    if next_t.value == 'import' and self.import_callback:
-                        assert isinstance(path_str, str) and path_str, "Macro import bounds structurally require validated file mapping paths"
-                        self.import_callback(path_str)
-                    
-                    if next_t.value == 'using' and path_str in self.exported_macros:
-                        cnud, cled = self.exported_macros[path_str]
-                        for k, v in cnud.items():
-                            self.registry.nud_rules[-1].setdefault(k,[]).extend(v)
-                        for k, v in cled.items():
-                            self.registry.led_rules[-1].setdefault(k,[]).extend(v)
-                            
                     path_node = ASTNode(NodeType.Value, value=path_str, line=t.line, col=t.col)
-                    return ASTNode(NodeType.Intrinsic, value=next_t.value, children=[path_node], line=t.line, col=t.col)
+
+                    if next_t.value == 'using':
+                        if path_str in self.exported_macros:
+                            cnud, cled = self.exported_macros[path_str]
+                            for k, v in cnud.items():
+                                self.registry.nud_rules[-1].setdefault(k,[]).extend(v)
+                            for k, v in cled.items():
+                                self.registry.led_rules[-1].setdefault(k,[]).extend(v)
+                        return ASTNode(NodeType.Using, children=[path_node], line=t.line, col=t.col)
+                    
+                    if next_t.value == 'import':
+                        if self.import_callback:
+                            assert isinstance(path_str, str) and path_str, "Macro import bounds structurally require validated file mapping paths"
+                            self.import_callback(path_str)
+                        return ASTNode(NodeType.Import, children=[path_node], line=t.line, col=t.col)
+                        
+                    if next_t.value == 'embed':
+                        return ASTNode(NodeType.Embed, children=[path_node], line=t.line, col=t.col)
+                        
                 else:
                     raise SyntaxError(f"Unknown intrinsic @{next_t.value} at line {next_t.line}:{next_t.col}")
             
@@ -351,7 +363,7 @@ class Parser:
                 return self.expand_macro(rules, t, None)
             
             node = ASTNode(NodeType.Identifier, value=t.value, line=t.line, col=t.col)
-            node.type_name = self.get_type(t.value)
+            node.type_node = self.get_type(t.value)
             return node
 
         elif (t.type == TokenType.VALUE):
@@ -378,7 +390,7 @@ class Parser:
                 
                 if left.node_type == NodeType.Identifier:
                     call_node = ASTNode(NodeType.Call, value=left.value, children=args, line=t.line, col=t.col)
-                    call_node.type_name = self.get_type(left.value)
+                    call_node.type_node = self.get_type(left.value)
                     return call_node
                 else:
                     raise SyntaxError(f"Syntax Error at line {t.line}:{t.col} -> Cannot call non-identifier {getattr(left, 'value', left)}")
@@ -397,12 +409,9 @@ class Parser:
                 if is_slice:
                     return ASTNode(NodeType.Lens, left=left, right=inner_expr, line=t.line, col=t.col)
 
-                type_name = build_type_name(inner_expr)
-                assert type_name, "Failed to resolve type name from annotation"
-                left.type_name = type_name
-                
+                left.type_node = inner_expr
                 if left.node_type == NodeType.Identifier:
-                    self.declare_type(left.value, type_name)
+                    self.declare_type(left.value, inner_expr)
                 return left
 
             if t.value == '=':
@@ -463,7 +472,7 @@ class Parser:
                 if left.node_type == NodeType.Identifier:
                     combined = left.value + "." + right_t.value
                     node = ASTNode(NodeType.Identifier, value=combined, line=t.line, col=t.col)
-                    node.type_name = self.get_type(combined)
+                    node.type_node = self.get_type(combined)
                     return node
                 raise SyntaxError(f"Syntax Error: Can only use '.' on identifiers at {t.line}:{t.col}")
                 
@@ -474,6 +483,7 @@ class Parser:
                     return self.expand_macro(valid_rules, t, left)
 
         raise SyntaxError(f"Unexpected infix operator {t} at line {t.line}:{t.col}")
+
     def expand_macro(self, rule_list, token, left):
         assert rule_list, "expand_macro called with an empty rule_list"
         assert token is not None, "expand_macro requires a valid trigger token"
@@ -492,8 +502,8 @@ class Parser:
                 
                 if left is not None:
                     expected_left = rule.hole_types.get(rule.pattern[0])
-                    if expected_left and left.type_name and left.type_name != expected_left:
-                        raise SyntaxError(f"Macro type mismatch: '{rule.pattern[0]}' expected [{expected_left}], got[{left.type_name}]")
+                    if expected_left and getattr(left, 'type_node', None) and not ast_nodes_equal(left.type_node, expected_left):
+                        raise SyntaxError(f"Macro type mismatch: '{rule.pattern[0]}' structural expectation failed")
                     captured[rule.pattern[0]] = left
                     start_idx = 2 
                 
@@ -504,9 +514,8 @@ class Parser:
                         assert arg_node is not None, f"Macro expected an expression for hole '{p}' but got nothing"
                         
                         expected_type = rule.hole_types.get(p)
-                        
-                        if expected_type and getattr(arg_node, 'type_name', None) and getattr(arg_node, 'type_name', None) != expected_type:
-                            raise SyntaxError(f"Macro type mismatch: '{p}' expected[{expected_type}], got[{getattr(arg_node, 'type_name', None)}]")
+                        if expected_type and getattr(arg_node, 'type_node', None) and not ast_nodes_equal(arg_node.type_node, expected_type):
+                            raise SyntaxError(f"Macro type mismatch: '{p}' structural expectation failed")
                             
                         captured[p] = arg_node
                     else:
@@ -517,7 +526,7 @@ class Parser:
                 expanded_body = substitute_ast(rule.body, captured)
                 assert isinstance(expanded_body, ASTNode) or expanded_body is None, "Macro expansion failed to produce a valid ASTNode"
                 
-                expanded_body.vmg_pure_out_target = rule.out_name # Tells the compiler backend to lock mutation
+                expanded_body.vmg_pure_out_target = rule.out_name 
                 expanded_body.is_pure = not rule.is_mutating  
                 expanded_body.macro_owner = "int" 
                 return expanded_body
@@ -555,12 +564,11 @@ class Parser:
         out_name_tok = self.consume(TokenType.IDENTIFIER)
         assert out_name_tok is not None, "Macro definition missing output name"
         out_name = out_name_tok.value
-        out_type = None
+        out_type_node = None
         
         if self.match('['):
             out_type_node = self.parse_expr(0)
             assert out_type_node is not None, "Macro output type definition cannot be empty"
-            out_type = build_type_name(out_type_node)
             self.match(']')
             
         self.match('=')
@@ -576,7 +584,7 @@ class Parser:
                 if self.match('['):
                     t_type_node = self.parse_expr(0)
                     assert t_type_node is not None, f"Type annotation for hole '{tok.value}' cannot be empty"
-                    hole_types[tok.value] = build_type_name(t_type_node)
+                    hole_types[tok.value] = t_type_node
                     self.match(']')
             elif tok.type == TokenType.SYMBOL and tok.value == ',':
                 continue
@@ -586,11 +594,7 @@ class Parser:
         body = self.parse_expr()
         assert body is not None, "Macro body expression cannot be empty"
         
-        # Enforce Visible Mutation Guarantee: If macro doesn't have '=', block must be pure
-        #if not is_mutating and not body.is_body_pure():
-        #    raise SyntaxError(f"Visible Mutation Guarantee Violation at line {token.line}:{token.col} -> Macro pattern is marked pure but body contains mutations")
-        
-        rule = MacroRule(prec, pattern, holes, out_name, body, hole_types, out_type, is_mutating)
+        rule = MacroRule(prec, pattern, holes, out_name, body, hole_types, out_type_node, is_mutating)
         self.registry.register(rule)
 
     def parse_asm_intrinsic(self, token):
@@ -607,7 +611,7 @@ class Parser:
             assert arg_expr is not None, "Failed to parse argument in @asm intrinsic"
             args.append(arg_expr)
         self.match(')')
-        return ASTNode(NodeType.Intrinsic, value="asm", children=[ASTNode(NodeType.Identifier, value=inst_name)] + args, line=token.line, col=token.col)
+        return ASTNode(NodeType.Asm, children=[ASTNode(NodeType.Identifier, value=inst_name)] + args, line=token.line, col=token.col)
 
 def parse(token_list, registry=None, skip_blocks=False, type_env=None, exported_macros=None, import_callback=None):
     if registry is None: 

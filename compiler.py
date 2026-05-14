@@ -1,20 +1,22 @@
+
 import platform
 import tokens
 import AST
-from AST import NodeType, ASTNode
+from AST import NodeType, ASTNode, ast_nodes_equal
 from typing import Dict, List, Optional
 from dataclasses import dataclass
+from enum import Enum, auto
 import ctypes
 
 
-def is_body_pure(self) -> bool:
+def is_body_pure(self: ASTNode) -> bool:
     """Return True if the AST subtree contains no visible mutation."""
     if self is None:
         return True
     if self.node_type == NodeType.Assignment:
         if getattr(self.left, 'node_type', None) == NodeType.Lens and self.left.left is None:
             return False
-    if self.node_type == NodeType.Intrinsic and self.value == "asm":
+    if self.node_type == NodeType.Asm:
         if self.children and platform.is_mutating_instruction(self.children[0].value): 
             return False
     
@@ -26,6 +28,8 @@ def is_body_pure(self) -> bool:
     if getattr(self, 'right', None) and isinstance(self.right, ASTNode) and not self.right.is_body_pure():
         return False
     return True
+
+ASTNode.is_body_pure = is_body_pure
 
 class ComptimeFolder:
     def __init__(self, cpu_lib, cpu_state_type, full_ast):
@@ -46,14 +50,12 @@ class ComptimeFolder:
         return funcs
 
     def evaluate_node(self, node):
-        # Reset the platform for micro-compilation
         platform.init()
         platform.asm.code = bytearray()
         platform.asm.labels = {}
         platform.asm.fixups = {}
         platform.asm.pc = 0
         
-        # Jump over function definitions
         platform.jump("comptime_main")
         
         temp_comp = Compiler()
@@ -64,19 +66,17 @@ class ComptimeFolder:
             temp_comp._compile_node(f)
             
         platform.label("comptime_main")
-        platform.emit_instruction("addi", platform.get_register("fp"), platform.get_register("sp"), 0)
+        platform.emit_instruction("addi", platform.fp, platform.sp, 0)
         
-        # Micro-compile the isolated node
         platform.start_scope()
         temp_comp._compile_node(node)
         platform.end_scope(returns=1)
         
-        platform.pop(platform.get_register("a0"))
+        platform.pop(platform.a0)
         platform.halt()
         
         bin_data = platform.get_binary()
         
-        # Run Native CPU Emulator Sandbox
         cpu = self.RiscVState()
         self.lib.init_cpu(ctypes.byref(cpu))
         for i, b in enumerate(bin_data):
@@ -91,7 +91,6 @@ class ComptimeFolder:
             raise TimeoutError("Comptime execution exceeded max cycle limit")
             
         val = cpu.regs[10]
-        # Standardize 32-bit uint back to signed integer format for the AST
         if val >= 0x80000000:
             val -= 0x100000000
         return val
@@ -99,8 +98,6 @@ class ComptimeFolder:
     def has_only_static_caller_contexts(self, n):
         if not n: 
             return True
-        
-        # If it's a hygiene-substituted node, it must resolve to a raw Value
         if getattr(n, 'caller_context_depth', 0) > 0:
             if n.node_type != NodeType.Value: 
                 return False
@@ -148,7 +145,7 @@ class ComptimeFolder:
                         node.children = []
                         node.left = None
                         node.right = None
-                        node.vmg_pure_out_target = None # Prevent compiler wrapping it again
+                        node.vmg_pure_out_target = None 
                 except Exception:
                     pass
 
@@ -174,7 +171,6 @@ class Workspace:
             folder = ComptimeFolder(self.cpu_lib, self.cpu_state_type, full_ast)
             folder.fold(full_ast)
         
-        # Reset platform explicitly after Comptime micro-compilations finish
         platform.init()
         platform.asm.code = bytearray()
         platform.asm.labels = {}
@@ -187,6 +183,35 @@ class Workspace:
         assert hasattr(result_platform, 'get_code_length') and result_platform.get_code_length() > 0, "Compilation critically output zero executable machine code instructions"
         return result_platform
 
+    def _resolve_namespaces(self, node, current_type_context=None):
+        """Recursively mangles inner identifiers to match their namespace context constraints inline."""
+        if not node: return
+        
+        next_context = current_type_context
+        
+        if node.node_type == NodeType.Definition:
+            is_dot = isinstance(node.value, str) and node.value.startswith('.')
+            if is_dot:
+                ctx = current_type_context if current_type_context else "main"
+                node.value = ctx + node.value
+                next_context = ctx
+            else:
+                next_context = node.value
+            
+        elif node.node_type in (NodeType.Identifier, NodeType.Call):
+            if isinstance(node.value, str) and node.value.startswith('.'):
+                ctx = current_type_context if current_type_context else "main"
+                node.value = ctx + node.value
+            if isinstance(node.value, str) and '.' in node.value:
+                node.is_static = True
+
+        for child in getattr(node, 'children', []):
+            self._resolve_namespaces(child, next_context)
+        if getattr(node, 'left', None):
+            self._resolve_namespaces(node.left, next_context)
+        if getattr(node, 'right', None):
+            self._resolve_namespaces(node.right, next_context)
+
     def discover_file(self, filepath):
         assert isinstance(filepath, str), "Filepath must be processed as a strict string type"
         
@@ -198,7 +223,6 @@ class Workspace:
             source = f.read()
         
         token_list = tokens.tokenize(source)
-        
         parser = AST.Parser(token_list, self.macro_registry, skip_blocks=False, type_env=self.global_types, exported_macros=self.global_macros, import_callback=self.discover_file)
         ast_skeleton = parser.parse_program()
         
@@ -209,9 +233,8 @@ class Workspace:
         if not node: 
             return
             
-        if node.node_type == NodeType.Intrinsic and node.value == "import":
-            assert len(node.children) == 1, "Import intrinsic explicitly requires exactly one path parameter argument"
-            assert isinstance(node.children[0].value, str) and node.children[0].value, "Import logically mandates structurally defined path literal string mapping external logic sources"
+        if node.node_type == NodeType.Import:
+            assert len(node.children) == 1, "Import node explicitly requires exactly one path parameter argument"
             self.discover_file(node.children[0].value)
             return
             
@@ -219,15 +242,16 @@ class Workspace:
             assert isinstance(node.value, str) and node.value, "Function definition must possess a structural name string"
             
             func_name = node.value
-            if func_name.startswith('.'):
-                if current_type:
-                    func_name = current_type + func_name
-                    node.value = func_name 
+            is_dot = func_name.startswith('.')
+            if is_dot:
+                ctx = current_type if current_type else "main"
+                func_name = ctx + func_name
+                node.value = func_name 
             
-            ret_type = node.left.type_name if node.left else None
+            ret_type = node.left.type_node if node.left else None
             self.global_types[func_name] = ret_type
             
-            new_type = current_type if func_name.startswith('.') else func_name
+            new_type = (current_type if current_type else "main") if is_dot else func_name
             for child in getattr(node, 'children',[]):
                 self._extract_signatures(child, current_filepath, new_type)
             if getattr(node, 'left', None):
@@ -255,6 +279,7 @@ class Workspace:
         
         assert ast_full is not None, "Semantic parser failed to construct a final AST framework"
         self._inline_imports(ast_full)
+        self._resolve_namespaces(ast_full) # Cleans stringly-type mangling before code generation
         
         assert ast_full.node_type == NodeType.Block, "Semantic parse routine must definitively yield a Block root node"
         return ast_full
@@ -263,10 +288,10 @@ class Workspace:
         if not node or not hasattr(node, 'children'): 
             return
         
-        new_children =[]
+        new_children = []
         for child in node.children:
-            if child.node_type == NodeType.Intrinsic and child.value == "import":
-                assert len(child.children) == 1, "Import intrinsic explicitly requires exactly one path parameter argument"
+            if child.node_type == NodeType.Import:
+                assert len(child.children) == 1, "Import explicitly requires exactly one path parameter argument"
                 path = child.children[0].value 
                 
                 imported_ast = self.semantic_parse_file(path)
@@ -296,7 +321,6 @@ class Compiler:
         self.macro_expansion_stack = []
         self.local_fp_offset = 0
         self.loop_base_fp_offset = 0
-        self.tco_triggered_in_expression = False
 
     def enter_scope(self):
         assert isinstance(self.scopes, list), "Scope stack framework lost structural integrity"
@@ -315,10 +339,9 @@ class Compiler:
     def compile(self, node: ASTNode):
         platform.init()
         self._register_functions(node)
-        #TODO: check if file name should be injected here or smth
         self.current_type_context = getattr(self, 'current_type_context', "main")
         
-        platform.emit_instruction("addi", platform.get_register("fp"), platform.get_register("sp"), 0)
+        platform.emit_instruction("addi", platform.fp, platform.sp, 0)
         
         platform.start_scope()
         self._compile_statement_sequence(node.children)
@@ -337,8 +360,8 @@ class Compiler:
         self._compile_statement_sequence(node.children)
         
         self.exit_scope()
-        platform.end_scope(returns=0)
 
+        platform.end_scope(returns=0)
         self.local_fp_offset = start_fp_offset
 
     def _register_functions(self, node: ASTNode, current_type_context=None):
@@ -346,11 +369,8 @@ class Compiler:
             return
         
         if node.node_type == NodeType.Definition:
-            func_name = node.value
+            func_name = node.value 
             
-            if func_name.startswith(".") and current_type_context:
-                func_name = current_type_context + func_name
-                
             if node.left.node_type == NodeType.Identifier:
                 ret_nodes =[node.left]
             elif node.left.node_type == NodeType.Tuple:
@@ -417,14 +437,12 @@ class Compiler:
         depth = getattr(node, 'caller_context_depth', 0)
         popped_states = []
         
-        # Winding Down (Restoring Caller context)
         if depth > 0:
             for _ in range(depth):
                 if self.pure_context_history:
                     popped_states.append(self.pure_context_out_var)
                     self.pure_context_out_var = self.pure_context_history.pop()
 
-        # --- THE MACRO HARDWARE WRAPPER ---
         has_vmg = getattr(node, 'vmg_pure_out_target', None) is not None
         if has_vmg:
             self.macro_expansion_counter += 1
@@ -438,57 +456,36 @@ class Compiler:
             self.pure_context_history.append(old_pure_out_var)
             self.pure_context_out_var = node.vmg_pure_out_target
             
-            # Physically allocate the output slot for the macro
             platform.push(platform.x0)
             out_sym = self.declare_symbol(node.vmg_pure_out_target)
 
             old_lhs = getattr(self, 'current_assignment_lhs', None)
             self.current_assignment_lhs = None
 
-        # Execute the unrolled node
         method_name = node.node_type.name
         visitor = getattr(self, method_name, self.error)
-        result = visitor(node)
+        visitor(node)
 
-        # --- EXTRACT THE MACRO RESULT ---
         if has_vmg:
             self.current_assignment_lhs = old_lhs
+            platform.read_local(platform.a0, out_sym.fp_offset, node.vmg_pure_out_target)
             
-            # Extract the calculated value from local memory
-            platform.read_local(platform.t0, out_sym.fp_offset, node.vmg_pure_out_target)
             self.exit_scope()
             platform.end_scope(returns=0)
+                
             self.local_fp_offset = start_fp_offset
-            
             self.pure_context_history.pop()
             self.pure_context_out_var = old_pure_out_var
-            
             self.macro_expansion_stack.pop()
             
-            # Push it so the parent Assignment receives exactly 1 item!
-            platform.push(platform.t0)
+            platform.push(platform.a0)
 
-        # Winding Up (Restoring Macro context)
         if depth > 0:
             for saved_out_var in reversed(popped_states):
                 self.pure_context_history.append(self.pure_context_out_var)
                 self.pure_context_out_var = saved_out_var
                 
-        return result
       
-    def _ast_nodes_equal(self, n1, n2):
-        if n1 is None and n2 is None:       return True
-        if n1 is None or n2 is None:        return False
-        
-        if n1.node_type != n2.node_type:    return False
-        if n1.value != n2.value:            return False
-        if len(n1.children) != len(n2.children):    return False
-        for c1, c2 in zip(n1.children, n2.children):
-            if not self._ast_nodes_equal(c1, c2):           return False
-        if not self._ast_nodes_equal(n1.left, n2.left):     return False
-        if not self._ast_nodes_equal(n1.right, n2.right):   return False
-        return True
-    
     def error(self, node):
         raise NotImplementedError(f"CRITICAL: Unmapped evaluation method for AST structure {node.node_type} at line {node.line}:{node.col}")
     
@@ -511,43 +508,38 @@ class Compiler:
 
     def Identifier(self, node):
         name = node.value
-        if name.startswith(".") and getattr(self, 'current_type_context', None):
-            name = self.current_type_context + name
-
         if hasattr(self, 'static_fields') and name in self.static_fields:
             val = self.static_fields[name]
             if isinstance(val, str):
                 data = val.encode('utf-8')
                 skip_label = self.get_unique_label("skip_str")
-                platform.jump_and_link(platform.t0, skip_label)
+                platform.jump_and_link(platform.a0, skip_label)
                 platform.emit_aligned_bytes(data)
                 platform.label(skip_label)
                 
-                platform.push(platform.t0)
+                platform.push(platform.a0)
                 platform.push_value(len(data))
             else:
                 platform.push_value(val)
             return
 
-        sym = self.get_symbol(node.value)
+        sym = self.get_symbol(name)
         if not sym: 
-            if node.type_name:
+            if node.type_node:
                 platform.push(platform.x0)
-                sym = self.declare_symbol(node.value)
+                sym = self.declare_symbol(name)
                 return
-            raise ValueError(f"Undefined variable footprint lookup: '{node.value}' at line {node.line}:{node.col}")
+            raise ValueError(f"Undefined variable footprint lookup: '{name}' at line {node.line}:{node.col}")
             
-        platform.read_local(platform.t0, sym.fp_offset, node.value) 
-        platform.push(platform.t0)
+        platform.read_local(platform.a0, sym.fp_offset, name) 
+        platform.push(platform.a0)
 
     def Definition(self, node):
         func_name = node.value
-        if func_name.startswith(".") and getattr(self, 'current_type_context', None):
-            func_name = self.current_type_context + func_name
-
-        ret_nodes =[]
+        ret_nodes = []
+        
         if node.left.node_type == NodeType.Identifier:
-            ret_nodes =[node.left]
+            ret_nodes = [node.left]
         elif node.left.node_type == NodeType.Tuple:
             ret_nodes = node.left.children
 
@@ -559,7 +551,7 @@ class Compiler:
         elif pattern_node.node_type == NodeType.Tuple:
             pat_args = pattern_node.children
         else:
-            pat_args =[pattern_node]
+            pat_args = [pattern_node]
             
         func_label = self._mangle_label(func_name, pat_args)
         
@@ -574,7 +566,6 @@ class Compiler:
         old_ret_node = getattr(self, 'current_return_node', None)
         self.current_return_node = node.left
         
-        # Track argument signature length to strictly protect overloaded target footprinting 
         old_args_len = getattr(self, 'current_function_args_len', -1)
         self.current_function_args_len = len(pat_args)
         
@@ -583,12 +574,11 @@ class Compiler:
         
         # PROLOGUE
         platform.push(platform.ra)
-        platform.push(platform.get_register("fp"))
-        platform.emit_instruction("addi", platform.get_register("fp"), platform.get_register("sp"), 0)
+        platform.push(platform.fp)
+        platform.emit_instruction("addi", platform.fp, platform.sp, 0)
         
         platform.start_scope()
         
-        # Map Arguments (Above FP)
         arg_offset = -(2 + len(pat_args))
         for p in pat_args:
             p_name = None
@@ -613,7 +603,6 @@ class Compiler:
                     self.declare_symbol(rv.value)
 
         self.loop_base_fp_offset = self.local_fp_offset
-
         platform.label(func_label + "_loop")
             
         old_type_ctx = getattr(self, 'current_type_context', None)
@@ -631,13 +620,11 @@ class Compiler:
         safe_regs = platform.get_safe_regs()
         
         if ret_nodes:
-            #TODO: stackbleed.
             assert len(ret_nodes) <= len(safe_regs), f"Function {func_name} exceeds maximum allowed return values ({len(safe_regs)})"
-
             for i, rv in enumerate(ret_nodes):
                 if rv.node_type == NodeType.Identifier:
                     sym = self.get_symbol(rv.value)
-                    platform.read_local(safe_regs[i], sym.fp_offset, node.value)
+                    platform.read_local(safe_regs[i], sym.fp_offset, rv.value)
                 else:
                     self._compile_node(rv)
                     platform.pop(safe_regs[i])
@@ -647,10 +634,9 @@ class Compiler:
         platform.end_scope(returns=0)
         
         # EPILOGUE
-        platform.emit_instruction("addi", platform.get_register("sp"), platform.get_register("fp"), 0)
-        platform.pop(platform.get_register("fp"))
+        platform.emit_instruction("addi", platform.sp, platform.fp, 0)
+        platform.pop(platform.fp)
         platform.pop(platform.ra)
-        
         platform.return_jump()
         
         self.local_fp_offset = old_local_fp_offset
@@ -658,16 +644,11 @@ class Compiler:
         
         self.current_function_name = old_func_name
         self.current_function_args_len = old_args_len
-        
         platform.label(skip_label)
-
 
     def Call(self, node):
         func_name = node.value
         call_args = node.children
-        
-        if func_name.startswith(".") and getattr(self, 'current_type_context', None):
-            func_name = self.current_type_context + func_name
             
         defs = self.function_registry.get(func_name, [])
         defs = [d for d in defs if len(d['pat_args']) == len(call_args)]
@@ -679,7 +660,6 @@ class Compiler:
         self.current_assignment_lhs = None
         
         platform.start_scope()
-        
         for arg in call_args:
             self._compile_node(arg)
             
@@ -689,7 +669,6 @@ class Compiler:
         end_dispatch_label = self.get_unique_label("end_disp")
         match_found_statically = False
         
-        # Arity guard required to prevent overloads from trampling stack variables if TCO replaces parameters!
         is_tro = False
         if getattr(self, 'current_function_name', None) == func_name:
             ret_node = getattr(self, 'current_return_node', None)
@@ -702,7 +681,7 @@ class Compiler:
                 if actual_args_on_stack == getattr(self, 'current_function_args_len', -1):
                     is_tro = True
             elif lhs_node is not None and ret_node is not None:
-                if self._ast_nodes_equal(lhs_node, ret_node):
+                if ast_nodes_equal(lhs_node, ret_node):
                     if actual_args_on_stack == getattr(self, 'current_function_args_len', -1):
                         is_tro = True
         
@@ -725,31 +704,29 @@ class Compiler:
                     has_runtime_checks = True
                     offset_from_top = len(call_args) - i
                     
-                    platform.read_relative(platform.t0, -offset_from_top)
-                    platform.load_immediate(platform.t1, p.value)
-                    platform.branch_not_equal(platform.t0, platform.t1, next_def_label)
+                    platform.read_relative(platform.a0, -offset_from_top)
+                    platform.load_immediate(platform.a1, p.value)
+                    platform.branch_not_equal(platform.a0, platform.a1, next_def_label)
                     
             if static_fail:
                 continue
                
             if is_tro:
                 temp_regs = platform.get_temp_regs_for_tco(actual_args_on_stack)
-                #TODO: bleed to stack.
                 assert len(temp_regs) == actual_args_on_stack, f"Hardware limitation: TCO requires {actual_args_on_stack} temp registers, but only {len(temp_regs)} are safely available."
-                for reg in reversed(temp_regs):
-                    platform.pop(reg)
+                
+                for i, reg in enumerate(temp_regs):
+                    offset_from_top = actual_args_on_stack - i
+                    platform.read_relative(reg, -offset_from_top)
                     
                 for i, reg in enumerate(temp_regs):
                     target_offset = -(2 + len(pat_args)) + (i + (len(pat_args) - actual_args_on_stack))
                     platform.write_local(target_offset, reg, node.value)
                     
                 offset_bytes = getattr(self, 'loop_base_fp_offset', 0) * platform.REGISTER_SIZE
-                platform.emit_instruction("addi", platform.get_register("sp"), platform.get_register("fp"), offset_bytes)
+                platform.emit_instruction("addi", platform.sp, platform.fp, offset_bytes)
                     
                 platform.jump(definition['label'] + "_loop")
-                
-                platform.compile_time_adjust_stack(actual_args_on_stack)
-                self.tco_triggered_in_expression = True
             else:
                 platform.call(definition['label'])
                 platform.jump(end_dispatch_label)
@@ -761,31 +738,28 @@ class Compiler:
                 break
                 
         if not match_found_statically:
-            #TODO: should this just be an assert?
             platform.halt()
             
         platform.label(end_dispatch_label)
         
         num_returns = len(defs[0]['ret_nodes']) if defs else 1
         safe_regs = platform.get_safe_regs()
-        #TODO: bleed to stack.
         assert num_returns <= len(safe_regs), "Too many return values for safe register extraction during Call"
-        if is_tro:
-            platform.abandon_scope()
-        else:
-            push_count = num_returns if num_returns > 0 else 1
-            for i in range(push_count):
-                platform.push(safe_regs[i])
-            platform.end_scope(returns=push_count)
+
+        push_count = num_returns if num_returns > 0 else 1
+        for i in range(push_count):
+            platform.push(safe_regs[i])
+        platform.end_scope(returns=push_count)
+        
 
     def Lens(self, node):
         platform.start_scope()
         
         if node.left is None:
             self._compile_node(node.right)
-            platform.pop(platform.t0) 
-            platform.load_deref(platform.t1, platform.t0)
-            platform.push(platform.t1)
+            platform.pop(platform.a0) 
+            platform.load_deref(platform.a1, platform.a0)
+            platform.push(platform.a1)
             platform.end_scope(returns=1)
         else:
             self._compile_node(node.left)
@@ -831,41 +805,33 @@ class Compiler:
         if node.left.node_type == NodeType.Identifier:
             name = node.left.value
             
-            if name and name.startswith(".") and getattr(self, 'current_type_context', None):
-                name = self.current_type_context + name
-                node.left.value = name
-                
+            if getattr(node.left, 'is_static', False):
                 if not hasattr(self, 'static_fields'):
                     self.static_fields = {}
                     
                 rhs_node = node.right
-                if getattr(rhs_node, 'node_type', None) == NodeType.Call and rhs_node.value == self.current_type_context:
+                if getattr(rhs_node, 'node_type', None) == NodeType.Call and rhs_node.value == getattr(self, 'current_type_context', None):
                     rhs_node = rhs_node.children[0]
                     
                 if getattr(rhs_node, 'node_type', None) == NodeType.Value:
                     self.static_fields[name] = rhs_node.value
                     self.current_assignment_lhs = old_lhs
                     return
+
                 
             platform.start_scope()
             self._compile_node(node.right)
-            
-            if getattr(self, 'tco_triggered_in_expression', False):
-                self.tco_triggered_in_expression = False
-                self.current_assignment_lhs = old_lhs
-                platform.abandon_scope()
-                return
             
             platform.end_scope(returns=1)
             
             sym = self.get_symbol(name)
             if sym:
-                platform.pop(platform.t0)
-                platform.write_local(sym.fp_offset, platform.t0, node.value)
+                platform.pop(platform.a0)
+                platform.write_local(sym.fp_offset, platform.a0, name)
             else:
-                platform.peek(platform.t0)
+                platform.peek(platform.a0)
                 sym = self.declare_symbol(name)
-                platform.write_local(sym.fp_offset, platform.t0, node.value)
+                platform.write_local(sym.fp_offset, platform.a0, name)
 
         elif node.left.node_type == NodeType.Lens and node.left.left is None:
             self.current_assignment_lhs = None
@@ -874,30 +840,18 @@ class Compiler:
             self.current_assignment_lhs = node.left
             self._compile_node(node.right)
             
-            if getattr(self, 'tco_triggered_in_expression', False):
-                self.tco_triggered_in_expression = False
-                self.current_assignment_lhs = old_lhs
-                platform.abandon_scope()
-                return
-                
             platform.end_scope(returns=2)
-            platform.pop(platform.t0)
-            platform.pop(platform.t1)
-            platform.store_deref(platform.t1, platform.t0)
+            platform.pop(platform.a0)
+            platform.pop(platform.a1)
+            platform.store_deref(platform.a1, platform.a0)
             
         elif node.left.node_type == NodeType.Tuple:
             platform.start_scope()
             self._compile_node(node.right)
             
-            if getattr(self, 'tco_triggered_in_expression', False):
-                self.tco_triggered_in_expression = False
-                self.current_assignment_lhs = old_lhs
-                platform.abandon_scope()
-                return
-                
             num_targets = len(node.left.children)
             platform.end_scope(returns=num_targets)
-            
+                
             safe_regs = platform.get_safe_regs()
             for i in reversed(range(num_targets)):
                 platform.pop(safe_regs[i])
@@ -905,16 +859,13 @@ class Compiler:
             for i, target in enumerate(node.left.children):
                 if target.node_type == NodeType.Identifier:
                     target_name = target.value
-                    if target_name and target_name.startswith(".") and getattr(self, 'current_type_context', None):
-                        target_name = self.current_type_context + target_name
-                        
                     sym = self.get_symbol(target_name)
                     if sym:
-                        platform.write_local(sym.fp_offset, safe_regs[i], node.value)
+                        platform.write_local(sym.fp_offset, safe_regs[i], target_name)
                     else:
                         platform.push(safe_regs[i])
                         self.declare_symbol(target_name)
-                        platform.write_local(self.get_symbol(target_name).fp_offset, safe_regs[i], node.value)
+                        platform.write_local(self.get_symbol(target_name).fp_offset, safe_regs[i], target_name)
                         
                 elif target.node_type == NodeType.Lens and target.left is None:
                     for r in range(num_targets): 
@@ -926,16 +877,17 @@ class Compiler:
                     self.current_assignment_lhs = node.left
                     platform.end_scope(returns=1)
                     
-                    platform.pop(platform.t1)
+                    platform.pop(platform.a1)
                     for r in reversed(range(num_targets)): 
                         platform.pop(safe_regs[r])
                         
-                    platform.store_deref(platform.t1, safe_regs[i])
+                    platform.store_deref(platform.a1, safe_regs[i])
     
         else:
             raise SyntaxError(f"Syntax logic check failed at {node.line}:{node.col}")
 
         self.current_assignment_lhs = old_lhs
+        
 
     def MacroCall(self, node):
         self.enter_scope()
@@ -969,13 +921,13 @@ class Compiler:
         self.pure_context_out_var = old_pure_out_var
         self.pure_context_history.pop()
 
-        platform.read_local(platform.t0, out_sym.fp_offset, node.value)
+        platform.read_local(platform.a0, out_sym.fp_offset, node.value)
         self.exit_scope()
         self.macro_expansion_stack.pop()
 
         platform.end_scope(returns=0)
         self.local_fp_offset = start_fp_offset
-        platform.push(platform.t0)
+        platform.push(platform.a0)
     
     def _compile_statement_sequence(self, children):
         old_lhs = getattr(self, 'current_assignment_lhs', None)
@@ -987,40 +939,36 @@ class Compiler:
                 self.current_assignment_lhs = old_lhs
                 
             self._compile_node(child)
-            
-            if getattr(self, 'tco_triggered_in_expression', False):
-                continue
 
         self.current_assignment_lhs = old_lhs
+        
 
-    def MacroDef(self, node):
-        pass
 
     def Pipeline(self, node):
         self._compile_node(node.left)
         if node.right:
             self._compile_node(node.right)
 
-    def Intrinsic(self, node):
-        if node.value == "asm":
-            self._compile_asm(node)
-        elif node.value == "embed":
-            self._compile_embed(node)
+    def Import(self, node):
+        pass 
 
-    def _compile_embed(self, node):
+    def Using(self, node):
+        pass
+
+    def Embed(self, node):
         path = node.children[0].value
         with open(path, "rb") as f: 
             data = f.read()
             
         skip_label = self.get_unique_label("skip_embed")
-        platform.jump_and_link(platform.t0, skip_label)
+        platform.jump_and_link(platform.a0, skip_label)
         platform.emit_aligned_bytes(data)
         platform.label(skip_label)
         
-        platform.push(platform.t0)
+        platform.push(platform.a0)
         platform.push_value(len(data))
 
-    def _compile_asm(self, node):
+    def Asm(self, node):
         inst_name = node.children[0].value
 
         if self.pure_context_out_var is not None:
@@ -1084,7 +1032,6 @@ class Compiler:
         eval_nodes = [e for e in eval_args if e['type'] == 'eval']
         
         platform.start_scope()
-        #TODO: bleed regs to stack.
         assert len(eval_nodes) <= len(temp_pool), f"Assembly expression requires {len(eval_nodes)} temporary registers, but only {len(temp_pool)} are available."
 
         for e in eval_nodes:
@@ -1105,8 +1052,9 @@ class Compiler:
                 args.append(e['val'])
         try:        
             platform.emit_instruction(inst_name, *args)
-        except AttributeError :
+        except AttributeError:
             raise AttributeError(f"attrib error raised from node: {inst_name}, {self.current_type_context} {node.line}:{node.col}")
+            
         if store_back_sym:
             platform.write_local(store_back_sym.fp_offset, rd_reg_to_push, output_name)
             platform.end_scope(returns=0)

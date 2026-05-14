@@ -107,19 +107,12 @@ int : value[int] = (bytes[0:4]):{
     };
 };
 sys : value[int] = (bytes[0:0]): {
-    .read_stdin : bytes_read[int] = (dest_ptr[int], max_len[int]) : {
-        @asm(addi, x17, zero, 3); // Syscall 3: Read
-        @asm(add, x11, zero, dest_ptr);
-        @asm(add, x12, zero, max_len);
-        @asm(ecall);
-        @asm(add, bytes_read, zero, x10); // Returns bytes read in a0
-    };
-
-    .read : [ptr] = (ptr[int], len[int]) : {
-        @asm(addi, x17, zero, 3); // Syscall 3: read stdout
+    .read : out, [ptr] = (ptr[int], len[int]) : {
+        @asm(addi, x17, zero, 3); // Syscall 3: read stin
         @asm(add, x11, zero, ptr);
         @asm(add, x12, zero, len);
         @asm(ecall);
+        @asm(add, out, x0, a0);
     };
     .write : _ = (ptr[int], len[int]) : {
         @asm(addi, x17, zero, 2); // Syscall 2: write stdout

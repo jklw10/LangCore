@@ -329,7 +329,7 @@ parse_loop : _ = (0, ptr[int], max_ptr[int], line[int], col[int]) : {
 
 
 // --- Execution Entry ---
-bytes_read = sys.read_stdin(SOURCE_PTR, MAX_LEN);
+bytes_read = sys.read(SOURCE_PTR, MAX_LEN);
 assert(bytes_read > 0);
 
 end_ptr = SOURCE_PTR + bytes_read;
