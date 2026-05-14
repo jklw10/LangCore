@@ -11,7 +11,6 @@ t3 = 28     #register
 a0 = 10     #register
 a7 = 17     #register
 
-# Full standard RISC-V ABI to integer registers
 reg_map = {f"x{i}": i for i in range(32)}
 reg_map.update({
     "zero": 0, "ra": 1, "sp": 2, "gp": 3, "tp": 4,
@@ -37,16 +36,71 @@ stack_ptr = 2
 stack_start = 0x8000 
 stack_incr = REGISTER_SIZE
 
+current_stack_slots = 0
+scope_depths = []
+
+def start_scope():
+    scope_depths.append(current_stack_slots)
+
+def get_scope_pushed():
+    if scope_depths:
+        return current_stack_slots - scope_depths[-1]
+    return 0
+
+def abandon_scope():
+    if scope_depths:
+        scope_depths.pop()
+
+def compile_time_adjust_stack(delta):
+    global current_stack_slots
+    current_stack_slots += delta
+
+def end_scope(returns=0):
+    global current_stack_slots
+    assert scope_depths, "No active scope to end"
+    start_depth = scope_depths.pop()
+    
+    diff = current_stack_slots - start_depth - returns
+    if diff > 0:
+        if returns > 0:
+            for i in range(returns):
+                offset_from_top = (returns - i) * REGISTER_SIZE
+                asm.lw(t0, stack_ptr, -offset_from_top)
+                
+                offset_to_write = (diff + returns - i) * REGISTER_SIZE
+                asm.sw(stack_ptr, -offset_to_write, t0)
+        shrink_stack(diff)
+    elif diff < 0:
+        assert False, f"Stack underflow in scope! Expected at least {start_depth + returns}, got {current_stack_slots}"
+
 def init():
+    global current_stack_slots
+    current_stack_slots = 0
+    scope_depths.clear()
     load_immediate(stack_ptr, stack_start)
 
 def push(reg):
+    global current_stack_slots
     asm.sw(stack_ptr, 0, reg)                
-    asm.addi(stack_ptr, stack_ptr, stack_incr)     
+    asm.addi(stack_ptr, stack_ptr, stack_incr)
+    current_stack_slots += 1
 
 def pop(reg):
+    global current_stack_slots
+    assert current_stack_slots > 0, \
+        f"Compiler Stack Tracking Underflow! Attempted to generate pop({reg}) on an empty stack structure."
+     
     asm.addi(stack_ptr, stack_ptr, -stack_incr)  
     asm.lw(reg, stack_ptr, 0)                  
+    current_stack_slots -= 1
+
+def shrink_stack(slots_count):
+    global current_stack_slots
+    assert current_stack_slots >= slots_count, \
+        f"Compiler Stack Tracking Underflow! Attempted to shrink ({slots_count}) slots with only ({current_stack_slots}) left."
+    
+    asm.addi(stack_ptr, stack_ptr, -(slots_count * REGISTER_SIZE))
+    current_stack_slots -= slots_count
 
 def peek(reg):
     asm.lw(reg, stack_ptr, -stack_incr)
@@ -72,7 +126,7 @@ def push_static(addr):
 
 def pop_static(addr):
     pop(t0)
-    asm.sw(addr,0,t0)
+    asm.sw(addr, 0, t0)
 
 def push_mem():
     pop(t0)
@@ -81,7 +135,7 @@ def push_mem():
 def pop_mem():
     pop(t0)
     pop(t1)
-    asm.sw(t0,0,t1)
+    asm.sw(t0, 0, t1)
 
 # ---- Backend Abstraction Interface ----
 
@@ -95,14 +149,19 @@ def get_temp_regs_for_tco(count):
 def get_temp_regs_for_asm():
     return [6, 7, 28, 29, 30, 31]
 
-def read_local(dest_reg, offset):
-    asm.lw(dest_reg, stack_ptr, offset)
+def read_local(dest_reg, fp_offset_slots, name=""):
+    byte_offset = fp_offset_slots * REGISTER_SIZE
+    asm.lw(dest_reg, reg_map["fp"], byte_offset)
 
-def write_local(offset, src_reg):
-    asm.store(stack_ptr, offset, src_reg)
+def write_local(fp_offset_slots, src_reg, name=""):
+    byte_offset = fp_offset_slots * REGISTER_SIZE
+    asm.sw(reg_map["fp"], byte_offset, src_reg)
 
-def shrink_stack(bytes_count):
-    asm.addi(stack_ptr, stack_ptr, -bytes_count)
+def read_relative(dest_reg, relative_slot_offset):
+    asm.lw(dest_reg, stack_ptr, relative_slot_offset * REGISTER_SIZE)
+
+def write_relative(relative_slot_offset, src_reg):
+    asm.sw(stack_ptr, relative_slot_offset * REGISTER_SIZE, src_reg)
 
 def jump(label_name):
     asm.jal(x0, label_name)
@@ -130,13 +189,19 @@ def halt():
     asm.ecall()
 
 def store_deref(addr_reg, src_reg):
-    asm.store(addr_reg, 0, src_reg)
+    asm.sw(addr_reg, 0, src_reg)
 
 def load_deref(dest_reg, addr_reg):
     asm.lw(dest_reg, addr_reg, 0)
 
 def emit_bytes(data):
     asm.code.extend(data)
+
+def emit_aligned_bytes(data):
+    emit_bytes(data)
+    padding = (REGISTER_SIZE - (len(data) % REGISTER_SIZE)) % REGISTER_SIZE
+    if padding > 0:
+        emit_bytes(b'\x00' * padding)
 
 def emit_instruction(inst_name, *args):
     asm_method = getattr(asm, inst_name)
@@ -167,10 +232,13 @@ def has_rd_register(inst_name):
     return inst_name not in no_rd_instructions
 
 def reset_assembler():
+    global current_stack_slots
     asm.code = bytearray()
     asm.labels = {}
     asm.fixups = {}
     asm.pc = 0
+    current_stack_slots = 0
+    scope_depths.clear()
 
 def get_binary():
     return asm.get_binary()

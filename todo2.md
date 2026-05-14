@@ -56,3 +56,9 @@ When the dynamic dispatch system encounters arguments that fail all patterns, it
 * **Cross-File / Global Macro Injection:** [RESOLVED]. Resolved by capturing AST Block Scopes upon closing `}` and permanently attributing them to the top-level assigned identifier via 2-pass compilation. `@using(int)` now successfully intercepts the linear flow and alters the active language reality at exactly the intended moment.
 * **Tail Recursion Optimization (TRO):** [RESOLVED]. Standard `jal` calls are bypassed dynamically at compile-time if the compiler matches a self-call, performing argument overwrite and `jal _loop` natively. Stack overflow risk in standard loops is mitigated.
 * **Pattern Matching Dispatch:** [RESOLVED]. True runtime dynamic dispatch is now implemented. The compiler evaluates arguments and emits assembly branching (`bne`) to route execution to the correct mangled label block at runtime. Lack of exhaustive fallback patterns throws an explicit compile-time error if statically provable, or triggers a native runtime trap (`ecall`) if a dynamically evaluated value falls through all available patterns.
+
+
+i think i should just change platform to have a scope start and scope end, have the assert for scope size in there, and since the language shape is what it is, it should be possible to make the caller / call position responsible for pushing the return value positions onto the stack. especially due to named return being the only way. so you always know how much is being returned before even calling the function. so i can make the entire internals of a function a 0 sum for stack.
+i can guarantee that stack size only increases when a symbol is being declared the first time?
+oh it's like rust's lifetimes and ownership but easy understand?
+hmm and i can just completely delete everything within scope when exiting. heap touches would pass through [ptr] out too.

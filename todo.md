@@ -14,31 +14,10 @@ during debugging:
 
 current task:
 
-tokenizer.w is skipping past it's last ecall or looping endlessly
+most recent analysis:
 
-asdasdasd
-
-
-
-->
-Execution finished in 427 cycles.
-Final SP (x2): 0x00008028
-Final a0 (x10): 2
-
-if you feed in just 2 letters it runs in 200 ish cycles and is fine. something in the loop is breaking. 
-
-a
-
-->
-Execution finished in 630 cycles.
-Final SP (x2): 0x0000802c
-Final a0 (x10): 3
-
-your analysis:
-
-
-
-
+the .w code:
+std.w:
 bool : value[bool] = (byte[0:1]):{
     .value = byte;
     // Control Flow (Null-Denotation / Prefix)
