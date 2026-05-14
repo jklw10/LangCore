@@ -300,7 +300,7 @@ class Compiler:
             
         platform.read_local(platform.t0, sym.fp_offset, node.value) 
         platform.push(platform.t0)
-        
+
     def FunctionDef(self, node):
         func_name = node.value
         if func_name.startswith(".") and getattr(self, 'current_type_context', None):
@@ -493,7 +493,8 @@ class Compiler:
                
             if is_tro:
                 temp_regs = platform.get_temp_regs_for_tco(actual_args_on_stack)
-                
+                #TODO: bleed to stack.
+                assert len(temp_regs) == actual_args_on_stack, f"Hardware limitation: TCO requires {actual_args_on_stack} temp registers, but only {len(temp_regs)} are safely available."
                 for reg in reversed(temp_regs):
                     platform.pop(reg)
                     
@@ -519,13 +520,15 @@ class Compiler:
                 break
                 
         if not match_found_statically:
+            #TODO: should this just be an assert?
             platform.halt()
             
         platform.label(end_dispatch_label)
         
         num_returns = len(defs[0]['ret_nodes']) if defs else 1
         safe_regs = platform.get_safe_regs()
-
+        #TODO: bleed to stack.
+        assert num_returns <= len(safe_regs), "Too many return values for safe register extraction during Call"
         if is_tro:
             platform.abandon_scope()
         else:
@@ -886,7 +889,9 @@ class Compiler:
         eval_nodes = [e for e in eval_args if e['type'] == 'eval']
         
         platform.start_scope()
-        
+        #TODO: bleed regs to stack.
+        assert len(eval_nodes) <= len(temp_pool), f"Assembly expression requires {len(eval_nodes)} temporary registers, but only {len(temp_pool)} are available."
+
         for e in eval_nodes:
             self._compile_node(e['node'])
             

@@ -61,6 +61,8 @@ def end_scope(returns=0):
     start_depth = scope_depths.pop()
     
     diff = current_stack_slots - start_depth - returns
+    assert diff >= 0, f"Scope physics violation: Ending scope requires clearing {diff} slots, which indicates memory corruption or missing pops."
+
     if diff > 0:
         if returns > 0:
             for i in range(returns):
@@ -96,6 +98,8 @@ def pop(reg):
 
 def shrink_stack(slots_count):
     global current_stack_slots
+    
+    assert slots_count >= 0, f"Cannot dynamically shrink stack by a negative slot count: {slots_count}"
     assert current_stack_slots >= slots_count, \
         f"Compiler Stack Tracking Underflow! Attempted to shrink ({slots_count}) slots with only ({current_stack_slots}) left."
     
@@ -142,8 +146,12 @@ def pop_mem():
 def get_safe_regs():
     return [18, 19, 20, 21, 22, 23, 24, 25]
 
+# TODO count and assert should probably be done for all of these.
+# possibly even a stack alloc incase you run out of registers.
+# you could then use registers everywhere and bleed into stack when needed.
 def get_temp_regs_for_tco(count):
     regs = [5, 6, 7, 28, 29, 30, 31, 10, 11, 12, 13, 14, 15, 16, 17]
+    assert count <= len(regs), f"TCO Compilation Limit Exceeded: Requires {count} concurrent argument registers, system provides only {len(regs)}."
     return regs[:count]
 
 def get_temp_regs_for_asm():

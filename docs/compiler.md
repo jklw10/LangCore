@@ -13,10 +13,10 @@ The compiler avoids single-pass compilation to support global macro resolution a
 ## 2. Memory & Stack Physics
 The compiler strictly models hardware realities. There is no heap, no garbage collection, and no hidden allocations.
 
-*   **Strict Depth Tracking:** The compiler statically tracks the stack pointer byte depth via `current_stack_depth`. 
-*   **Negative Offset Mapping:** Variables physically live in the active frame *below* the current floating `sp`. Accessing a variable evaluates its absolute stack position and subtracts the current depth to generate a strict negative offset (e.g., `-12(sp)`).
+*   **Strict Depth Tracking:** The compiler statically tracks the stack pointer byte depth via `current_stack_depth` within local scopes to ensure absolute cleanup upon scope exit.
+*   **The Frame Pointer (`fp`):** Function boundaries establish a strict Frame Pointer. Arguments passed into the function physically live *below* the `fp` (accessed via negative offsets like `-3(fp)`), while local variables declared within the function's scope are allocated *above* the `fp` (accessed via positive offsets like `+1(fp)`).
 *   **Zero-Initialization:** Declared variables physically force `x0` (zero) onto the stack.
-*   **Frame Boundaries:** Scopes mathematically record stack depth upon entry. Upon exit, the compiler mathematically shrinks the stack back to the baseline.
+*   **Frame Boundaries:** Scopes mathematically record stack depth upon entry. Upon exit, the compiler mathematically shrinks the stack pointer (`sp`) back to the baseline.
 *   **Static Embeds:** Strings and `@embed` files are statically packed into the text segment via a physical jump-over sequence, bypassing the dynamic stack.
 
 ## 3. Dynamic Pattern Dispatch

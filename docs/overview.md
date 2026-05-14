@@ -70,11 +70,10 @@ The language utilizes **Explicit Mutation**. Functions and expressions are pure 
 ---
 
 ## 7. Functions & The Ban on Closures
-To support advanced DOD transformations, functions can be passed as runtime values. However, to strictly protect the Visible Mutation Guarantee, **Closures are fundamentally banned.**
-
-*   A function passed as a value is strictly a physical memory address of a pure logic block.
+To support advanced DOD transformations, functions are architecturally treated as pure logic blocks. However, to strictly protect the Visible Mutation Guarantee, **Closures are fundamentally banned.**
+*   **Functions as value** **TODO**: passed by pointer to logic location. I think with the rules in place this might be doable statically at compile time?
 *   **No Environment Capturing:** A runtime lambda cannot capture variables from its surrounding lexical scope. If a function requires external data, it must be explicitly passed as an argument.
-*   This guarantees that passing a function is exactly as fast as a native CPU jump (`jalr`), completely avoiding the hidden heap allocations normally required for closure environment objects. And the mutation stays visible.
+*   **Function Pointers (Planned):** While the syntax allows passing functions as values, true dynamic dispatch over raw memory addresses is heavily restricted to prevent opaque side-effects. Currently, function resolution is strictly evaluated at compile-time via the static registry.
 
 ---
 
