@@ -5,10 +5,10 @@ def sign_extend(val, bits):
     return val
 
 def disassemble(bytecode):
-    print(f"\n{'='*40}\nDisassembly\n{'='*40}")
-    
+    inst_map = {}
     for i in range(0, len(bytecode), 4):
-        if i + 4 > len(bytecode): break
+        if i + 4 > len(bytecode): 
+            break
         
         inst = int.from_bytes(bytecode[i:i+4], 'little')
         opcode = inst & 0x7F
@@ -22,16 +22,23 @@ def disassemble(bytecode):
         
         if opcode == 0x13: # I-Type
             imm = sign_extend((inst >> 20) & 0xFFF, 12)
-            op = {0:"addi", 2:"slti", 3:"sltiu", 4:"xori", 6:"ori", 7:"andi"}.get(funct3, f"op_imm_{funct3}")
+            if funct3 == 5:
+                op = "srai" if (inst >> 30) & 1 else "srli"
+                imm = imm & 0x1F 
+            else:
+                op = {0:"addi", 1:"slli", 2:"slti", 3:"sltiu", 4:"xori", 6:"ori", 7:"andi"}.get(funct3, f"op_imm_{funct3}")
+                if funct3 == 1:
+                    imm = imm & 0x1F
             out += f"{op:<5} x{rd}, x{rs1}, {imm}"
             
         elif opcode == 0x33: # R-Type
             op = "unknown"
-            if funct3 == 0 and funct7 == 0x00: op = "add"
-            elif funct3 == 0 and funct7 == 0x20: op = "sub"
+            if funct3 == 0: op = "sub" if funct7 == 0x20 else "add"
+            elif funct3 == 1: op = "sll"
             elif funct3 == 2: op = "slt"
             elif funct3 == 3: op = "sltu"
             elif funct3 == 4: op = "xor"
+            elif funct3 == 5: op = "sra" if funct7 == 0x20 else "srl"
             elif funct3 == 6: op = "or"
             elif funct3 == 7: op = "and"
             out += f"{op:<5} x{rd}, x{rs1}, x{rs2}"
@@ -73,6 +80,6 @@ def disassemble(bytecode):
             
         else:
             out += f"??? (opcode 0x{opcode:02x})"
+        inst_map[i] = out
+    return inst_map
             
-        print(out)
-    print("="*40)

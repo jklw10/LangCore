@@ -369,24 +369,7 @@ class Compiler:
             return
         
         if node.node_type == NodeType.Definition:
-            func_name = node.value 
-            
-            if node.left.node_type == NodeType.Identifier:
-                ret_nodes =[node.left]
-            elif node.left.node_type == NodeType.Tuple:
-                ret_nodes = node.left.children
-            else:
-                ret_nodes =[]
-                
-            pattern_node = node.right
-            
-            if not pattern_node or (pattern_node.node_type == NodeType.Tuple and not pattern_node.children):
-                pat_args = list()
-            elif pattern_node.node_type == NodeType.Tuple:
-                pat_args = pattern_node.children
-            else:
-                pat_args = [pattern_node]
-                
+            func_name, ret_nodes, pat_args = self._extract_signature(node)
             func_label = self._mangle_label(func_name, pat_args)
             
             if func_name not in self.function_registry:
@@ -417,7 +400,35 @@ class Compiler:
                 self._register_functions(node.left, current_type_context)
             if getattr(node, 'right', None):
                 self._register_functions(node.right, current_type_context)
-    
+    def _extract_signature(self, node: ASTNode):
+        func_name = node.value
+        
+        # 1. Parse Return Nodes
+        left_type = getattr(node.left, 'node_type', None)
+        if node.left is None:
+            ret_nodes = []
+        elif left_type == NodeType.Identifier:
+            ret_nodes = [node.left]
+        elif left_type == NodeType.Lens and getattr(node.left, 'left', None) is None:
+            ret_nodes = [node.left] # Allow [ptr] as a valid VMG return target
+        elif left_type == NodeType.Tuple:
+            ret_nodes = node.left.children
+            for c in ret_nodes:
+                if getattr(c, 'node_type', None) not in (NodeType.Identifier, NodeType.Lens):
+                    raise SyntaxError(f"Invalid return signature component '{c.node_type}' for function '{func_name}' at line {node.line}:{node.col}")
+        else:
+            raise SyntaxError(f"Invalid return signature '{left_type}' for function '{func_name}' at line {node.line}:{node.col}")
+            
+        # 2. Parse Pattern Arguments
+        pattern_node = node.right
+        if not pattern_node or (pattern_node.node_type == NodeType.Tuple and not pattern_node.children):
+            pat_args = []
+        elif pattern_node.node_type == NodeType.Tuple:
+            pat_args = pattern_node.children
+        else:
+            pat_args = [pattern_node]
+            
+        return func_name, ret_nodes, pat_args
     def _mangle_label(self, func_name, pat_args, line_col=None):
         parts =[func_name.replace(".", "_")]
         if line_col:
@@ -433,7 +444,10 @@ class Compiler:
     def _compile_node(self, node: ASTNode):
         if not node: 
             return
-            
+        
+        if hasattr(node, 'line'):
+            platform.asm.current_user_line = f"Line {node.line}:{node.col}"
+
         depth = getattr(node, 'caller_context_depth', 0)
         popped_states = []
         
@@ -535,24 +549,8 @@ class Compiler:
         platform.push(platform.a0)
 
     def Definition(self, node):
-        func_name = node.value
-        ret_nodes = []
-        
-        if node.left.node_type == NodeType.Identifier:
-            ret_nodes = [node.left]
-        elif node.left.node_type == NodeType.Tuple:
-            ret_nodes = node.left.children
-
-        pattern_node = node.right
+        func_name, ret_nodes, pat_args = self._extract_signature(node)
         body = node.children[0]
-        
-        if not pattern_node or (pattern_node.node_type == NodeType.Tuple and not pattern_node.children):
-            pat_args = list()
-        elif pattern_node.node_type == NodeType.Tuple:
-            pat_args = pattern_node.children
-        else:
-            pat_args = [pattern_node]
-            
         func_label = self._mangle_label(func_name, pat_args)
         
         skip_label = self.get_unique_label("skip_func")
@@ -979,6 +977,8 @@ class Compiler:
         has_rd = platform.has_rd_register(inst_name)
         
         temp_pool = platform.get_temp_regs_for_asm() 
+        # Make sure register 5 (x5/t0) is NOT in temp_pool if you hardcode it below!
+        
         temp_idx = 0
         store_back_sym = None
         rd_reg_to_push = None
@@ -1008,19 +1008,19 @@ class Compiler:
             
             if isinstance(name, str) and platform.is_register(name):
                 eval_args.append({'type': 'literal', 'val': platform.get_register(name)})
-                if is_output: 
-                    rd_reg_to_push = platform.get_register(name)
+                # FIX: Do not set rd_reg_to_push for raw hardware registers.
+                # This prevents the compiler from leaving unconsumed values on the stack.
                 continue
                 
             if is_output:
                 sym = self.get_symbol(name)
                 if sym:
-                    eval_args.append({'type': 'reg', 'val': 5})
+                    eval_args.append({'type': 'reg', 'val': 5}) # Hardcoded x5 proxy
                     rd_reg_to_push = 5
                     output_name = name
                     store_back_sym = sym
                 else:
-                    platform.push(platform.x0)
+                    platform.push(platform.x0) # Make space on stack for new var
                     sym = self.declare_symbol(name)
                     eval_args.append({'type': 'reg', 'val': 5})
                     rd_reg_to_push = 5
@@ -1034,9 +1034,11 @@ class Compiler:
         platform.start_scope()
         assert len(eval_nodes) <= len(temp_pool), f"Assembly expression requires {len(eval_nodes)} temporary registers, but only {len(temp_pool)} are available."
 
+        # Evaluate arguments, pushing results to the stack
         for e in eval_nodes:
             self._compile_node(e['node'])
             
+        # Pop in reverse order to maintain correct instruction operand order
         for e in reversed(eval_nodes):
             tmp_reg = temp_pool[temp_idx]
             temp_idx += 1
@@ -1050,12 +1052,15 @@ class Compiler:
                 args.append(e['val'])
             else: 
                 args.append(e['val'])
+                
         try:        
             platform.emit_instruction(inst_name, *args)
         except AttributeError:
             raise AttributeError(f"attrib error raised from node: {inst_name}, {self.current_type_context} {node.line}:{node.col}")
             
+        # Handle Output writing
         if store_back_sym:
+            # Write x5 proxy back to the local variable
             platform.write_local(store_back_sym.fp_offset, rd_reg_to_push, output_name)
             platform.end_scope(returns=0)
         else:

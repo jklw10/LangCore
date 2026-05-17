@@ -107,12 +107,14 @@ int : value[int] = (bytes[0:4]):{
     };
 };
 sys : value[int] = (bytes[0:0]): {
-    .read : out, [ptr] = (ptr[int], len[int]) : {
+    .read : out[int] = (ptr[int], len[int]) : {
         @asm(addi, x17, zero, 3); // Syscall 3: read stin
         @asm(add, x11, zero, ptr);
         @asm(add, x12, zero, len);
+        //out = 0;
         @asm(ecall);
         @asm(add, out, x0, a0);
+        //[ptr] = out;
     };
     .write : _ = (ptr[int], len[int]) : {
         @asm(addi, x17, zero, 2); // Syscall 2: write stdout

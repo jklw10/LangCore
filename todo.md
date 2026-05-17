@@ -16,6 +16,84 @@ current task:
 
 most recent analysis:
 
+Based on an analysis of the compiled RISC-V assembly and your custom language source, I've identified several critical logical flaws. The reason your program terminates in exactly 128 cycles is due to a chain reaction caused by **Flaw #1** and **Flaw #3**, which results in `sys.read` returning `0`, immediately tripping the `assert(bytes_read > 0)` trap and halting the CPU. 
+
+Here is the breakdown of the logical flaws in the compiler's generated assembly so you can prune them out:
+
+### 1. The `x10` (`a0`) Clobbering Bug (Syscall Return Destruction)
+Your compiler uses `x10` as a hardcoded scratch register for moving values from the stack to local variables during assignments. 
+In `sys.read`, you have:
+```c
+@asm(ecall);
+out = 0;
+@asm(add, out, x0, a0);
+```
+**What it looks like in assembly:**
+```assembly
+ecall                 # Syscall finishes, a0 (x10) contains bytes_read
+addi  x5, x0, 0
+sw    x5, 0(x2)       # Pushes 0 to the stack
+addi  x2, x2, 4
+lw    x10, -4(x2)     # <--- BUG: Pops 0 into x10, DESTROYING a0!
+sw    x10, 4(x8)      # out = 0
+add   x5, x0, x10     # Inline asm executes, but x10 is now 0
+```
+Because the compiler uses `x10` to handle the assignment `out = 0;`, it blindly overwrites the `a0` register before your inline assembly can rescue the syscall's return value.
+
+### 2. Unrecognized Shift Instructions (`sll`, `srl`, `slli`)
+The compiler's instruction emitter doesn't recognize standard shift instructions and falls back to emitting raw strings/pseudo-placeholders. This completely breaks `_udiv_loop`, `mul10`, `mul16`, and `mul2`.
+**What it looks like in assembly:**
+```assembly
+# From mul10 (@asm(slli, t0, val, 3)):
+op_imm_1 x5, x7, 6    # 'slli' translated to bad pseudo-op
+
+# From _udiv_loop (@asm(srl, t1, n, i) and @asm(sll, bit, is_ge, i)):
+unknown x6, x7, x6    # 'srl' unrecognized!
+unknown x5, x7, x6    # 'sll' unrecognized!
+```
+
+### 3. Silent `0`-Return on Invalid Signatures
+Look at the signature for `sys.read`:
+```c
+.read : [ptr] = (ptr[int], len[int]) : {
+```
+The compiler fails to map the brackets `[ptr]` to a valid local return variable. Instead of throwing a syntax error, it silently ignores the return binding and defaults the function's return value to `0` (`x18 = 0`).
+**What it looks like in assembly (end of `sys.read`):**
+```assembly
+addi  x18, x0, 0      # x18 is the return register, hardcoded to 0
+addi  x2, x2, -4
+addi  x2, x8, 0       # Restore frame pointer
+```
+
+### 4. Memory Corruption via `[ptr] = out;`
+Because of the confusion with the `[ptr]` return signature, you wrote `[ptr] = out;` inside `sys.read`. The compiler faithfully translates this into a memory store. Since `ptr` is `SOURCE_PTR` (1000) and `out` is `0`, this overwrites the first 4 bytes of the input text buffer `"asdhsdlkfj"` with zeroes!
+**What it looks like in assembly:**
+```assembly
+addi  x2, x2, -4
+lw    x10, 0(x2)      # Pops 'out' (0)
+addi  x2, x2, -4
+lw    x11, 0(x2)      # Pops 'ptr' (1000)
+sw    x10, 0(x11)     # Stores 0x00000000 at address 1000!
+```
+
+### 5. Missing Tail Call Optimization (TCO)
+Despite the `// Native TCO` comments, the compiler does not optimize tail calls into jumps. Every recursive call creates a full stack frame, meaning `itoa_loop` and `_consume_ident_loop` will quickly trigger a stack overflow for large files.
+**What it looks like in assembly:**
+```assembly
+jal   x1, -1636 (-> 0x3e84)  # Standard function call (pushes ra to stack)
+jal   x0, 4 (-> 0x4440)
+sw    x18, 0(x2)             # Saves return value to current frame
+```
+A true TCO would pop the current frame and use `jal x0, ...` (an unconditional jump without modifying the return address `x1`).
+
+### Summary of the 128-cycle execution:
+1. `sys.read` is called. It correctly reads 10 bytes via syscall.
+2. The assignment `out = 0;` clobbers the `x10` return register. `out` becomes `0`.
+3. `[ptr] = out;` corrupts the first 4 bytes of your input string to `\0\0\0\0`.
+4. Due to the invalid return signature, `sys.read` returns `0` in `x18`.
+5. `bytes_read` is assigned `0`.
+6. The inline macro `assert(bytes_read > 0)` evaluates to false (`0 > 0`) and properly executes its `ecall` trap to halt the program immediately.
+
 the .w code:
 std.w:
 bool : value[bool] = (byte[0:1]):{
@@ -114,139 +192,4 @@ sys : value[int] = (bytes[0:0]): {
 }
 
 
-tokenizer.w:
-
-@import(tests/std.w);
-
-@using(bool);
-@using(int);
-@using(sys);
-
-SOURCE_PTR = 1000; //we live in hope
-MAX_LEN = 4096;
-
-// Function to read a single byte (Since we don't have [byte] lens yet)
-read_byte : val[int] = (ptr[int]) : {
-    // raw assembly to load byte unsigned (lbu) into 'val'
-    // Corrected positional arguments: (inst, rd, rs1, offset)
-    @asm(lbu, val, ptr, 0); 
-};
-
-// --- Lexer State Machine ---
-// loop signature: (is_done, current_ptr, max_ptr)
-parse_loop : _ = (1, ptr[int], max_ptr[int]) : {
-    // Done!
-};
-
-parse_loop : _ = (0, ptr[int], max_ptr[int]) : {
-    char = read_byte(ptr);
-    
-    // Check if whitespace (space = 32, \n = 10)
-    is_space = char == 32;
-    is_newline = char == 10;
-    
-    // assert char is within ASCII bounds
-    assert(char < 128);
-
-    if (is_space) {
-        // Skip
-    };
-    
-    if (is_newline) {
-        // Increment line number (to be implemented)
-    };
-
-    // TODO: Implement digit checks (char >= 48 && char <= 57)
-    // TODO: Implement identifier checks
-
-    // Recurse to next byte
-    next_ptr = ptr + 1;
-    is_done = next_ptr == max_ptr;
-    
-    _ = parse_loop(is_done, next_ptr, max_ptr);
-};
-
-
-// --- Main Execution ---
-bytes_read = sys.read_stdin(SOURCE_PTR, MAX_LEN);
-
-// Assert we actually read a file
-assert(bytes_read > 0);
-
-// Start State Machine
-end_ptr = SOURCE_PTR + bytes_read;
-_ = parse_loop(0, SOURCE_PTR, end_ptr);
-
-
-test.w:
-
-bool : value[bool] = (byte[0:1]):{
-    .value = byte;
-    // Control Flow (Null-Denotation / Prefix)
-    .@expr(2, if, cond, t_body) : out = (cond[bool], t_body) : {
-        @asm(beq, cond, zero, skip_body);
-        t_body;
-        @asm(label, skip_body)
-    }
-};
-
-//Math Operators (Left-Denotation / Infix)
-int : value[int] = (bytes[0:4]):{
-    .value = bytes;
-    .max = int(0x7fff);
-    .@expr(10, a, +, b) : out[int] = (a[int], b) : {
-        @asm(add, out, a, b);
-    };
-
-    .@expr(10, a, -, b) : out[int] = (a[int], b) : {
-        @asm(sub, out, a, b);
-    };
-    //2. Logic Operators
-    .@expr(9, a, <, b) : out[bool] = (a[int], b) : {
-        @asm(slt, out, a, b);
-    };
-    .@expr(9, a, >=, b) : out[bool] = (a[int], b) : {
-        @asm(slt, out, b, a);
-    };
-    .@expr(9, a, ==, b) : out[bool] = (a[int], b) : {
-        @asm(sub, out, a, b);
-        @asm(sltiu, out, out, 1);
-    };
-    .rand : value[int] = ():{
-        value = 4; //decided by fair dice
-    }
-};
-@using(bool);
-@using(int);
-
-// loop i >= 10 branch
-loop : sum[int], [ptr] = (0, i[int], sum[int], ptr) : {
-    sum = sum;
-} 
-// loop i < 10 branch
-loop : sum[int], [ptr] = (1, i[int], sum[int], ptr) : {
-    sum = sum + i;
-    
-    // (sum == 15) a [bool], triggering the 'if' macro!
-    if (sum == 15) {
-        [ptr] = sum;
-    };
-
-    sum, [ptr] = loop(i<10, i + 1, sum, ptr);
-};
-
-i[int] = 0;
-sum[int] = 0;
-ptr = 65000;
-sum, [ptr] = loop(1, i, sum, ptr)
-
-// Function Definitions dynamically returning an [int] type 
-// i need to look into forcing 2[int] or int(2) as input types instead of assuming type here:
-
-foo : res[int] = (1, 2) : { res = 10 };
-foo : res[int] = (x, 2) : { res = x + 10 };
-foo : res[int] = (x, y) : { res = 99 };
-
-[65000] = foo(1, 2); // Will be 10
-[65000] = foo(2, 2); // Will be 20
-[65000] = foo(5, 5); // Will be 99
+tokenizer2.w:

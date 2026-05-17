@@ -1,4 +1,6 @@
+import os
 import struct
+import traceback
 
 class RiscVAssembler:
     REGISTER_SIZE = 4 
@@ -7,13 +9,33 @@ class RiscVAssembler:
         self.labels = {}
         self.fixups = {}
         self.pc = 0
+        self.source_map = {}         
+        self.current_user_line = "?"  
 
     def get_binary(self):
         if self.fixups:
             remaining = list(self.fixups.keys())
             raise ValueError(f"Undefined label(s): {remaining}")
         return bytes(self.code)
+    
     def _emit(self, val):
+        current_pc = len(self.code)
+        
+        # Walk back the python stack to find the exact compiler origin
+        stack = traceback.extract_stack()
+        compiler_info = "Unknown"
+        for frame in reversed(stack[:-1]):
+            fname = os.path.basename(frame.filename)
+            # Ignore the assembler wrappers to find the true source in compiler.py
+            if fname not in ("asm.py", "platform.py"):
+                compiler_info = f"{fname}:{frame.lineno} ({frame.name})"
+                break
+                
+        # Link PC to both User .w code and the Python compiler code
+        self.source_map[current_pc] = {
+            "compiler": compiler_info,
+            "user_source": getattr(self, "current_user_line", "?")
+        }
         self.code.extend(struct.pack("<I", val))
     
     def label(self, name):
